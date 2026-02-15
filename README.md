@@ -328,6 +328,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Acknowledgments
 
 - [National Vulnerability Database (NVD)](https://nvd.nist.gov/) for the CVE data
+- [CISA Known Exploited Vulnerabilities Catalog (KEV)](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) for exploit data. 
 - [Anthropic](https://www.anthropic.com/) for Claude AI
 - The Rust community for excellent crates
 
