@@ -56,6 +56,10 @@ enum Commands {
         /// Force full re-sync (ignore existing data)
         #[arg(short, long)]
         force: bool,
+
+        /// Skip CISA KEV catalog sync
+        #[arg(long)]
+        no_kev: bool,
     },
 
     /// Scan an SBOM against the local CVE database (fast, no API calls)
@@ -67,6 +71,18 @@ enum Commands {
         /// Only show vulnerabilities with CVSS score >= this value
         #[arg(short = 'm', long, default_value = "0.0")]
         min_severity: f64,
+
+        /// Output format: text, json, or markdown
+        #[arg(short, long, default_value = "text")]
+        output: String,
+
+        /// Save scan results to file
+        #[arg(short = 'f', long)]
+        output_file: Option<PathBuf>,
+
+        /// Path to a manually downloaded CISA KEV catalog JSON file
+        #[arg(long)]
+        kev_file: Option<PathBuf>,
     },
 
     /// Analyze vulnerabilities with Claude AI for prioritization and remediation
@@ -86,6 +102,10 @@ enum Commands {
         /// Save analysis to file
         #[arg(short = 'f', long)]
         output_file: Option<PathBuf>,
+
+        /// Path to a manually downloaded CISA KEV catalog JSON file
+        #[arg(long)]
+        kev_file: Option<PathBuf>,
     },
 
     /// Show database statistics
@@ -95,6 +115,10 @@ enum Commands {
     Lookup {
         /// CVE ID (e.g., CVE-2024-1234)
         cve_id: String,
+
+        /// Path to a manually downloaded CISA KEV catalog JSON file
+        #[arg(long)]
+        kev_file: Option<PathBuf>,
     },
 
     /// Fetch recent CVEs from NVD API (does not save to DB)
@@ -269,6 +293,141 @@ pub struct Reference {
     pub source: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+// ============================================================================
+// CISA KEV (Known Exploited Vulnerabilities) Types
+// ============================================================================
+
+const KEV_URL: &str =
+    "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json";
+
+/// Raw CISA KEV JSON response structure
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KevResponse {
+    pub title: String,
+    pub catalog_version: String,
+    pub date_released: String,
+    pub count: usize,
+    pub vulnerabilities: Vec<KevVulnerability>,
+}
+
+/// A single KEV entry from CISA
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct KevVulnerability {
+    #[serde(rename = "cveID")]
+    pub cve_id: String,
+    pub vendor_project: String,
+    pub product: String,
+    pub vulnerability_name: String,
+    pub date_added: String,
+    pub short_description: String,
+    pub required_action: String,
+    pub due_date: String,
+    pub known_ransomware_campaign_use: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub cwes: Vec<String>,
+}
+
+/// Local KEV catalog (parallels CveDatabase pattern)
+#[derive(Debug, Serialize, Deserialize)]
+pub struct KevCatalog {
+    pub last_sync: String,
+    pub catalog_version: String,
+    pub date_released: String,
+    pub kev_count: usize,
+    pub vulnerabilities: HashMap<String, KevVulnerability>,
+}
+
+impl KevCatalog {
+    pub fn new() -> Self {
+        Self {
+            last_sync: Utc::now().to_rfc3339(),
+            catalog_version: String::new(),
+            date_released: String::new(),
+            kev_count: 0,
+            vulnerabilities: HashMap::new(),
+        }
+    }
+
+    pub fn get_db_path() -> Result<PathBuf, NvdError> {
+        if let Some(proj_dirs) = ProjectDirs::from("com", "nvd", "nvd-cve-scanner") {
+            let data_dir = proj_dirs.data_dir();
+            std::fs::create_dir_all(data_dir)?;
+            Ok(data_dir.join("kev_catalog.json"))
+        } else {
+            Ok(PathBuf::from("kev_catalog.json"))
+        }
+    }
+
+    pub fn load() -> Result<Self, NvdError> {
+        let path = Self::get_db_path()?;
+        if path.exists() {
+            let content = std::fs::read_to_string(&path)?;
+            let catalog: KevCatalog = serde_json::from_str(&content)?;
+            Ok(catalog)
+        } else {
+            Ok(Self::new())
+        }
+    }
+
+    pub fn save(&self) -> Result<(), NvdError> {
+        let path = Self::get_db_path()?;
+        let content = serde_json::to_string_pretty(self)?;
+        std::fs::write(&path, content)?;
+        Ok(())
+    }
+
+    pub fn contains(&self, cve_id: &str) -> bool {
+        self.vulnerabilities.contains_key(cve_id)
+    }
+
+    pub fn get(&self, cve_id: &str) -> Option<&KevVulnerability> {
+        self.vulnerabilities.get(cve_id)
+    }
+
+    pub fn update_from_response(&mut self, response: KevResponse) {
+        self.catalog_version = response.catalog_version;
+        self.date_released = response.date_released;
+        self.vulnerabilities.clear();
+        for vuln in response.vulnerabilities {
+            self.vulnerabilities.insert(vuln.cve_id.clone(), vuln);
+        }
+        self.kev_count = self.vulnerabilities.len();
+        self.last_sync = Utc::now().to_rfc3339();
+    }
+
+    pub fn ransomware_count(&self) -> usize {
+        self.vulnerabilities
+            .values()
+            .filter(|v| v.known_ransomware_campaign_use == "Known")
+            .count()
+    }
+
+    pub fn overdue_count(&self) -> usize {
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        self.vulnerabilities
+            .values()
+            .filter(|v| v.due_date < today)
+            .count()
+    }
+
+    /// Load KEV from a user-provided file
+    pub fn load_from_file(path: &PathBuf) -> Result<Self, NvdError> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            NvdError::IoError(e)
+        })?;
+        let response: KevResponse = serde_json::from_str(&content).map_err(|e| {
+            NvdError::SbomError(format!("Failed to parse KEV file: {}", e))
+        })?;
+        let mut catalog = Self::new();
+        catalog.update_from_response(response);
+        Ok(catalog)
+    }
 }
 
 // ============================================================================
@@ -705,6 +864,126 @@ impl NvdClient {
 
         Err(last_error.unwrap_or_else(|| NvdError::ApiError("Max retries exceeded".to_string())))
     }
+
+    /// Fetch the CISA Known Exploited Vulnerabilities catalog
+    pub async fn fetch_kev_catalog(&self) -> Result<KevResponse, NvdError> {
+        println!("Fetching CISA KEV catalog...");
+
+        let mut last_error = None;
+
+        for attempt in 1..=MAX_RETRIES {
+            match self.client.get(KEV_URL).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let kev: KevResponse = response.json().await?;
+                        println!(
+                            "  Retrieved {} KEV entries (catalog version: {})",
+                            kev.count, kev.catalog_version
+                        );
+                        return Ok(kev);
+                    } else if response.status().is_server_error() && attempt < MAX_RETRIES {
+                        let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                        eprintln!(
+                            "KEV server error ({}), retrying in {:?}... (attempt {}/{})",
+                            response.status(),
+                            delay,
+                            attempt,
+                            MAX_RETRIES
+                        );
+                        tokio::time::sleep(delay).await;
+                        last_error = Some(NvdError::ApiError(format!(
+                            "KEV API returned status: {}",
+                            response.status()
+                        )));
+                        continue;
+                    } else {
+                        return Err(NvdError::ApiError(format!(
+                            "KEV API returned status: {}",
+                            response.status()
+                        )));
+                    }
+                }
+                Err(e) if attempt < MAX_RETRIES => {
+                    let delay = std::time::Duration::from_secs(2u64.pow(attempt));
+                    eprintln!(
+                        "KEV request failed: {}, retrying in {:?}... (attempt {}/{})",
+                        e, delay, attempt, MAX_RETRIES
+                    );
+                    tokio::time::sleep(delay).await;
+                    last_error = Some(NvdError::from(e));
+                    continue;
+                }
+                Err(e) => return Err(NvdError::from(e)),
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            NvdError::ApiError("KEV max retries exceeded".to_string())
+        }))
+    }
+}
+
+/// Fetch fresh KEV catalog from CISA, falling back to local cache on failure.
+/// If a kev_file path is provided, loads from that file instead.
+async fn load_kev_live(
+    client: &NvdClient,
+    kev_file: Option<&PathBuf>,
+) -> Option<KevCatalog> {
+    // If user provided a manual KEV file, use it directly
+    if let Some(path) = kev_file {
+        println!("Loading KEV catalog from: {}", path.display());
+        match KevCatalog::load_from_file(path) {
+            Ok(catalog) => {
+                println!(
+                    "KEV catalog loaded: {} entries (version: {})",
+                    catalog.kev_count, catalog.catalog_version
+                );
+                return Some(catalog);
+            }
+            Err(e) => {
+                eprintln!("ERROR: Failed to load KEV file '{}': {}", path.display(), e);
+                return None;
+            }
+        }
+    }
+
+    // Try live fetch
+    match client.fetch_kev_catalog().await {
+        Ok(response) => {
+            let mut catalog = KevCatalog::new();
+            catalog.update_from_response(response);
+            // Cache locally for offline fallback
+            if let Err(e) = catalog.save() {
+                eprintln!("WARNING: Failed to cache KEV catalog locally: {}", e);
+            }
+            Some(catalog)
+        }
+        Err(e) => {
+            eprintln!("WARNING: Failed to fetch CISA KEV catalog: {}", e);
+            // Try local cache fallback
+            match KevCatalog::load() {
+                Ok(catalog) if catalog.kev_count > 0 => {
+                    eprintln!(
+                        "Falling back to cached KEV data ({} entries, last sync: {})",
+                        catalog.kev_count, catalog.last_sync
+                    );
+                    Some(catalog)
+                }
+                _ => {
+                    eprintln!("WARNING: CISA KEV catalog unavailable (fetch failed, no local cache).");
+                    eprintln!("KEV enrichment will be skipped for this run.");
+                    eprintln!(
+                        "Tip: You can manually provide a KEV catalog file with --kev-file <path>"
+                    );
+                    eprintln!(
+                        "     Download it from: {}",
+                        KEV_URL
+                    );
+                    None
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -782,8 +1061,10 @@ A brief overview of the security posture based on these findings.
 
 ### 2. Risk-Prioritized Vulnerability List
 Rank the vulnerabilities by actual risk considering:
+- **CISA KEV status** (vulnerabilities in the CISA Known Exploited Vulnerabilities catalog are confirmed to be actively exploited in the wild and MUST be prioritized above non-KEV entries, per BOD 22-01)
+- Ransomware association (KEV entries marked as "Known" ransomware campaign use are highest priority)
+- CISA remediation due date urgency
 - CVSS score (use the exact scores provided)
-- Exploitability (is there known exploitation in the wild based on the CVE data?)
 - Attack vector (network-accessible vs local)
 - Impact on confidentiality, integrity, and availability
 - The specific component affected and its role
@@ -797,7 +1078,14 @@ For each vulnerability (in priority order), provide:
 - **Workaround**: If no fix is available, what compensating controls can be applied
 
 ### 4. Summary Table
-Provide a table with columns: Priority | CVE ID | Component | CVSS | Recommended Action
+Provide a table with columns: Priority | CVE ID | Component | CVSS | KEV | Recommended Action
+
+### 5. CISA KEV Summary
+If any vulnerabilities are in the CISA KEV catalog, provide:
+- Total count of KEV entries found
+- Which ones have known ransomware campaign associations
+- Due dates and whether any are overdue
+- Compliance implications (reference BOD 22-01 if applicable)
 
 Be concise but thorough. Focus on actionable guidance."#,
             sbom_name = sbom_name,
@@ -911,6 +1199,22 @@ Be concise but thorough. Focus on actionable guidance."#,
                 }
             }
 
+            // Add KEV status
+            if let Some(ref kev) = m.kev_entry {
+                summary.push_str("- **CISA KEV**: YES - Known Exploited Vulnerability\n");
+                summary.push_str(&format!("- **KEV Date Added**: {}\n", kev.date_added));
+                summary.push_str(&format!("- **KEV Due Date**: {}\n", kev.due_date));
+                summary.push_str(&format!(
+                    "- **Ransomware Campaign Use**: {}\n",
+                    kev.known_ransomware_campaign_use
+                ));
+                summary.push_str(&format!("- **Required Action**: {}\n", kev.required_action));
+            } else {
+                summary.push_str(
+                    "- **CISA KEV**: No (not in Known Exploited Vulnerabilities catalog)\n",
+                );
+            }
+
             summary.push('\n');
         }
 
@@ -1020,12 +1324,14 @@ pub struct VulnerabilityMatch {
     pub component: SbomComponent,
     pub cve: Cve,
     pub match_type: String,
+    pub kev_entry: Option<KevVulnerability>,
 }
 
 pub fn scan_sbom_local(
     db: &CveDatabase,
     components: &[SbomComponent],
     min_severity: f64,
+    kev_catalog: Option<&KevCatalog>,
 ) -> Vec<VulnerabilityMatch> {
     let mut matches = Vec::new();
     // Use HashSet for O(1) duplicate detection instead of O(n) linear search
@@ -1065,6 +1371,7 @@ pub fn scan_sbom_local(
                                     component: component.clone(),
                                     cve: (*cve).clone(),
                                     match_type: "product name".to_string(),
+                                    kev_entry: kev_catalog.and_then(|k| k.get(&cve.id).cloned()),
                                 });
                             }
                         }
@@ -1087,6 +1394,7 @@ pub fn scan_sbom_local(
                                         component: component.clone(),
                                         cve: (*cve).clone(),
                                         match_type: "vendor:product".to_string(),
+                                        kev_entry: kev_catalog.and_then(|k| k.get(&cve.id).cloned()),
                                     });
                                 }
                             }
@@ -1112,6 +1420,7 @@ pub fn scan_sbom_local(
                                             component: component.clone(),
                                             cve: (*cve).clone(),
                                             match_type: "purl".to_string(),
+                                            kev_entry: kev_catalog.and_then(|k| k.get(&cve.id).cloned()),
                                         });
                                     }
                                 }
@@ -1133,6 +1442,7 @@ pub fn scan_sbom_local(
                                             component: component.clone(),
                                             cve: (*cve).clone(),
                                             match_type: "purl vendor:product".to_string(),
+                                            kev_entry: kev_catalog.and_then(|k| k.get(&cve.id).cloned()),
                                         });
                                     }
                                 }
@@ -1144,11 +1454,44 @@ pub fn scan_sbom_local(
         }
     }
 
-    // Sort by severity
+    // Sort by: KEV status first, then ransomware, then due date urgency, then CVSS score
     matches.sort_by(|a, b| {
+        let a_is_kev = a.kev_entry.is_some();
+        let b_is_kev = b.kev_entry.is_some();
+
+        // KEV entries sort above non-KEV entries
+        match (a_is_kev, b_is_kev) {
+            (true, false) => return std::cmp::Ordering::Less,
+            (false, true) => return std::cmp::Ordering::Greater,
+            _ => {}
+        }
+
+        // Within KEV tier: ransomware entries sort above non-ransomware
+        if a_is_kev && b_is_kev {
+            let a_ransom = a.kev_entry.as_ref()
+                .map(|k| k.known_ransomware_campaign_use == "Known")
+                .unwrap_or(false);
+            let b_ransom = b.kev_entry.as_ref()
+                .map(|k| k.known_ransomware_campaign_use == "Known")
+                .unwrap_or(false);
+            match (a_ransom, b_ransom) {
+                (true, false) => return std::cmp::Ordering::Less,
+                (false, true) => return std::cmp::Ordering::Greater,
+                _ => {}
+            }
+
+            // Then by due date (earliest/most urgent first)
+            let a_due = a.kev_entry.as_ref().map(|k| k.due_date.as_str()).unwrap_or("9999-99-99");
+            let b_due = b.kev_entry.as_ref().map(|k| k.due_date.as_str()).unwrap_or("9999-99-99");
+            if a_due != b_due {
+                return a_due.cmp(b_due);
+            }
+        }
+
+        // Finally, by CVSS score descending
         let score_a = a.cve.base_score().unwrap_or(0.0);
         let score_b = b.cve.base_score().unwrap_or(0.0);
-        score_b.partial_cmp(&score_a).unwrap()
+        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     matches
@@ -1233,8 +1576,222 @@ fn display_vulnerability_match(m: &VulnerabilityMatch) {
         println!("  PURL: {}", purl);
     }
     println!("  Match type: {}", m.match_type);
+
+    if let Some(ref kev) = m.kev_entry {
+        println!();
+        println!("  *** CISA KEV: KNOWN EXPLOITED VULNERABILITY ***");
+        println!("  KEV Date Added: {}", kev.date_added);
+        println!("  KEV Due Date:   {}", kev.due_date);
+        println!("  Ransomware Use: {}", kev.known_ransomware_campaign_use);
+        println!("  Required Action: {}", kev.required_action);
+        if let Some(ref notes) = kev.notes {
+            if !notes.is_empty() {
+                println!("  CISA Notes: {}", notes);
+            }
+        }
+    }
+
     println!();
     display_cve(&m.cve, false);
+}
+
+fn format_scan_output(
+    matches: &[VulnerabilityMatch],
+    sbom_name: &str,
+    min_severity: f64,
+    scan_time_ms: f64,
+    format: &str,
+) -> String {
+    let critical = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) >= 9.0).count();
+    let high = matches.iter().filter(|m| {
+        let s = m.cve.base_score().unwrap_or(0.0);
+        s >= 7.0 && s < 9.0
+    }).count();
+    let medium = matches.iter().filter(|m| {
+        let s = m.cve.base_score().unwrap_or(0.0);
+        s >= 4.0 && s < 7.0
+    }).count();
+    let low = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) < 4.0).count();
+    let kev_count = matches.iter().filter(|m| m.kev_entry.is_some()).count();
+    let ransomware_count = matches.iter().filter(|m| {
+        m.kev_entry.as_ref()
+            .map(|k| k.known_ransomware_campaign_use == "Known")
+            .unwrap_or(false)
+    }).count();
+
+    match format {
+        "json" => {
+            let json_output = serde_json::json!({
+                "sbom": sbom_name,
+                "scan_date": Utc::now().to_rfc3339(),
+                "scan_time_ms": scan_time_ms,
+                "total_vulnerabilities": matches.len(),
+                "min_severity_filter": min_severity,
+                "summary": {
+                    "critical": critical,
+                    "high": high,
+                    "medium": medium,
+                    "low": low,
+                    "kev_count": kev_count,
+                    "ransomware_associated": ransomware_count,
+                },
+                "vulnerabilities": matches.iter().map(|m| {
+                    serde_json::json!({
+                        "cve_id": m.cve.id,
+                        "component": m.component.name,
+                        "version": m.component.version,
+                        "cvss_score": m.cve.base_score(),
+                        "match_type": m.match_type,
+                        "in_kev": m.kev_entry.is_some(),
+                        "ransomware_use": m.kev_entry.as_ref()
+                            .map(|k| k.known_ransomware_campaign_use.clone()),
+                        "kev_due_date": m.kev_entry.as_ref()
+                            .map(|k| k.due_date.clone()),
+                        "kev_required_action": m.kev_entry.as_ref()
+                            .map(|k| k.required_action.clone()),
+                        "description": m.cve.english_description()
+                    })
+                }).collect::<Vec<_>>()
+            });
+            serde_json::to_string_pretty(&json_output).unwrap_or_default()
+        }
+        "markdown" => {
+            let mut md = String::new();
+            md.push_str("# Vulnerability Scan Report\n\n");
+            md.push_str(&format!("**SBOM**: {}\n\n", sbom_name));
+            md.push_str(&format!("**Date**: {}\n\n", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+            md.push_str(&format!("**Scan Time**: {:.2}ms\n\n", scan_time_ms));
+            md.push_str(&format!("**Total Vulnerabilities**: {}\n\n", matches.len()));
+            md.push_str(&format!("**CISA KEV Matches**: {} of {} in Known Exploited Vulnerabilities catalog\n\n", kev_count, matches.len()));
+            if ransomware_count > 0 {
+                md.push_str(&format!("**Ransomware Associated**: {}\n\n", ransomware_count));
+            }
+            md.push_str(&format!("**Minimum Severity Filter**: {:.1}\n\n", min_severity));
+
+            md.push_str("## Summary\n\n");
+            md.push_str("| Severity | Count |\n|----------|-------|\n");
+            md.push_str(&format!("| Critical (9.0+) | {} |\n", critical));
+            md.push_str(&format!("| High (7.0-8.9) | {} |\n", high));
+            md.push_str(&format!("| Medium (4.0-6.9) | {} |\n", medium));
+            md.push_str(&format!("| Low (0.0-3.9) | {} |\n", low));
+            md.push_str(&format!("| **CISA KEV (Exploited)** | **{}** |\n", kev_count));
+            if ransomware_count > 0 {
+                md.push_str(&format!("| Ransomware Associated | {} |\n", ransomware_count));
+            }
+
+            md.push_str("\n## Vulnerabilities\n\n");
+            md.push_str("| # | CVE ID | Component | CVSS | KEV | Description |\n");
+            md.push_str("|---|--------|-----------|------|-----|-------------|\n");
+            for (idx, m) in matches.iter().enumerate() {
+                let score = m.cve.base_score()
+                    .map(|s| format!("{:.1}", s))
+                    .unwrap_or_else(|| "N/A".to_string());
+                let kev_status = if m.kev_entry.is_some() { "**YES**" } else { "No" };
+                let desc = m.cve.english_description()
+                    .unwrap_or("No description")
+                    .chars()
+                    .take(100)
+                    .collect::<String>();
+                md.push_str(&format!(
+                    "| {} | {} | {} {} | {} | {} | {}... |\n",
+                    idx + 1,
+                    m.cve.id,
+                    m.component.name,
+                    m.component.version.as_deref().unwrap_or(""),
+                    score,
+                    kev_status,
+                    desc.replace('|', "\\|")
+                ));
+            }
+
+            // Detail section for KEV entries
+            let kev_matches: Vec<_> = matches.iter().filter(|m| m.kev_entry.is_some()).collect();
+            if !kev_matches.is_empty() {
+                md.push_str("\n## CISA KEV Details\n\n");
+                for m in &kev_matches {
+                    if let Some(ref kev) = m.kev_entry {
+                        md.push_str(&format!("### {} - {}\n\n", m.cve.id, m.component.name));
+                        md.push_str(&format!("- **Date Added**: {}\n", kev.date_added));
+                        md.push_str(&format!("- **Due Date**: {}\n", kev.due_date));
+                        md.push_str(&format!("- **Ransomware Use**: {}\n", kev.known_ransomware_campaign_use));
+                        md.push_str(&format!("- **Required Action**: {}\n\n", kev.required_action));
+                    }
+                }
+            }
+
+            md
+        }
+        _ => {
+            // Plain text format
+            let mut text = String::new();
+            text.push_str("VULNERABILITY SCAN REPORT\n");
+            text.push_str(&format!("SBOM: {}\n", sbom_name));
+            text.push_str(&format!("Date: {}\n", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+            text.push_str(&format!("Scan Time: {:.2}ms\n", scan_time_ms));
+            text.push_str(&format!("Vulnerabilities: {}\n", matches.len()));
+            text.push_str(&format!("CISA KEV Matches: {} of {} in Known Exploited Vulnerabilities catalog\n", kev_count, matches.len()));
+            if ransomware_count > 0 {
+                text.push_str(&format!("Ransomware Associated: {}\n", ransomware_count));
+            }
+            text.push_str(&format!("Min Severity: {:.1}\n", min_severity));
+            text.push_str(&format!("\n{}\n\n", "=".repeat(60)));
+            text.push_str(&format!("Critical (9.0+): {}\n", critical));
+            text.push_str(&format!("High (7.0-8.9):  {}\n", high));
+            text.push_str(&format!("Medium (4.0-6.9): {}\n", medium));
+            text.push_str(&format!("Low (0.0-3.9):   {}\n", low));
+            text.push_str(&format!("\n{}\n\n", "-".repeat(60)));
+
+            for (idx, m) in matches.iter().enumerate() {
+                let score = m.cve.base_score()
+                    .map(|s| format!("{:.1}", s))
+                    .unwrap_or_else(|| "N/A".to_string());
+                let kev_tag = if m.kev_entry.is_some() { " [KEV]" } else { "" };
+                text.push_str(&format!(
+                    "{}. {} | {} {} | CVSS: {}{}\n",
+                    idx + 1,
+                    m.cve.id,
+                    m.component.name,
+                    m.component.version.as_deref().unwrap_or(""),
+                    score,
+                    kev_tag
+                ));
+                if let Some(ref kev) = m.kev_entry {
+                    text.push_str(&format!("   CISA KEV: Known Exploited Vulnerability\n"));
+                    text.push_str(&format!("   Due Date: {} | Ransomware: {}\n", kev.due_date, kev.known_ransomware_campaign_use));
+                    text.push_str(&format!("   Required Action: {}\n", kev.required_action));
+                }
+                if let Some(desc) = m.cve.english_description() {
+                    let truncated = if desc.len() > 200 {
+                        format!("{}...", &desc[..200])
+                    } else {
+                        desc.to_string()
+                    };
+                    text.push_str(&format!("   {}\n", truncated));
+                }
+                text.push('\n');
+            }
+
+            text
+        }
+    }
+}
+
+fn display_kev_status(kev: &KevCatalog, cve_id: &str) {
+    if let Some(entry) = kev.get(cve_id) {
+        println!("*** CISA KEV STATUS: KNOWN EXPLOITED ***");
+        println!("  Date Added: {}", entry.date_added);
+        println!("  Due Date: {}", entry.due_date);
+        println!("  Ransomware Use: {}", entry.known_ransomware_campaign_use);
+        println!("  Required Action: {}", entry.required_action);
+        if let Some(ref notes) = entry.notes {
+            if !notes.is_empty() {
+                println!("  CISA Notes: {}", notes);
+            }
+        }
+        println!();
+    } else {
+        println!("CISA KEV Status: Not in KEV catalog\n");
+    }
 }
 
 // ============================================================================
@@ -1251,7 +1808,7 @@ async fn main() -> Result<(), NvdError> {
     let client = NvdClient::new(api_key.clone());
 
     match cli.command {
-        Commands::Sync { days, force } => {
+        Commands::Sync { days, force, no_kev } => {
             if api_key.is_some() {
                 println!("Using NVD API key for higher rate limits\n");
             } else {
@@ -1278,9 +1835,28 @@ async fn main() -> Result<(), NvdError> {
 
             println!("Database saved to: {:?}", CveDatabase::get_db_path()?);
             println!("Total CVEs in database: {}", db.cve_count);
+
+            // Sync KEV catalog
+            if !no_kev {
+                println!();
+                match client.fetch_kev_catalog().await {
+                    Ok(response) => {
+                        let mut kev_catalog = KevCatalog::new();
+                        kev_catalog.update_from_response(response);
+                        kev_catalog.save()?;
+                        println!("KEV catalog saved to: {:?}", KevCatalog::get_db_path()?);
+                        println!("Total KEV entries: {}", kev_catalog.kev_count);
+                        println!("Ransomware-associated: {}", kev_catalog.ransomware_count());
+                    }
+                    Err(e) => {
+                        eprintln!("WARNING: Failed to sync KEV catalog: {}", e);
+                        eprintln!("CVE sync completed successfully. KEV can be retried later.");
+                    }
+                }
+            }
         }
 
-        Commands::Scan { sbom, min_severity } => {
+        Commands::Scan { sbom, min_severity, output, output_file, kev_file } => {
             let db = CveDatabase::load()?;
 
             if db.cve_count == 0 {
@@ -1290,52 +1866,95 @@ async fn main() -> Result<(), NvdError> {
             }
 
             println!("Database: {} CVEs (last sync: {})\n", db.cve_count, db.last_sync);
+
+            // Fetch fresh KEV catalog
+            let kev_catalog = load_kev_live(&client, kev_file.as_ref()).await;
+
             println!("Loading SBOM from: {}\n", sbom.display());
 
             let components = parse_sbom(&sbom)?;
             println!("Found {} components in SBOM\n", components.len());
 
             let start = std::time::Instant::now();
-            let matches = scan_sbom_local(&db, &components, min_severity);
+            let matches = scan_sbom_local(&db, &components, min_severity, kev_catalog.as_ref());
             let elapsed = start.elapsed();
 
-            println!("════════════════════════════════════════════════════════════════");
-            println!("                    VULNERABILITY SCAN RESULTS                   ");
-            println!("════════════════════════════════════════════════════════════════\n");
-            println!("Scan completed in {:.2}ms\n", elapsed.as_secs_f64() * 1000.0);
+            let sbom_name = sbom.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown");
 
-            if matches.is_empty() {
-                println!(
-                    "No vulnerabilities found matching criteria (min severity: {:.1})",
-                    min_severity
+            let scan_time_ms = elapsed.as_secs_f64() * 1000.0;
+
+            // Build formatted output if writing to file or non-text format
+            if output_file.is_some() || output != "text" {
+                let output_content = format_scan_output(
+                    &matches, sbom_name, min_severity, scan_time_ms, &output,
                 );
+
+                if let Some(ref file_path) = output_file {
+                    std::fs::write(file_path, &output_content)?;
+                    println!("Scan results saved to: {}", file_path.display());
+                } else {
+                    println!("{}", output_content);
+                }
             } else {
-                println!(
-                    "Found {} vulnerabilities (min severity: {:.1})\n",
-                    matches.len(),
-                    min_severity
-                );
+                // Default text output to console
+                println!("════════════════════════════════════════════════════════════════");
+                println!("                    VULNERABILITY SCAN RESULTS                   ");
+                println!("════════════════════════════════════════════════════════════════\n");
+                println!("Scan completed in {:.2}ms\n", scan_time_ms);
 
-                let critical = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) >= 9.0).count();
-                let high = matches.iter().filter(|m| {
-                    let s = m.cve.base_score().unwrap_or(0.0);
-                    s >= 7.0 && s < 9.0
-                }).count();
-                let medium = matches.iter().filter(|m| {
-                    let s = m.cve.base_score().unwrap_or(0.0);
-                    s >= 4.0 && s < 7.0
-                }).count();
-                let low = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) < 4.0).count();
+                if matches.is_empty() {
+                    println!(
+                        "No vulnerabilities found matching criteria (min severity: {:.1})",
+                        min_severity
+                    );
+                } else {
+                    println!(
+                        "Found {} vulnerabilities (min severity: {:.1})\n",
+                        matches.len(),
+                        min_severity
+                    );
 
-                println!("Summary:");
-                println!("  🔴 Critical (9.0+): {}", critical);
-                println!("  🟠 High (7.0-8.9):  {}", high);
-                println!("  🟡 Medium (4.0-6.9): {}", medium);
-                println!("  🟢 Low (0.0-3.9):   {}", low);
-                println!();
+                    let critical = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) >= 9.0).count();
+                    let high = matches.iter().filter(|m| {
+                        let s = m.cve.base_score().unwrap_or(0.0);
+                        s >= 7.0 && s < 9.0
+                    }).count();
+                    let medium = matches.iter().filter(|m| {
+                        let s = m.cve.base_score().unwrap_or(0.0);
+                        s >= 4.0 && s < 7.0
+                    }).count();
+                    let low = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) < 4.0).count();
 
-                for m in &matches {
-                    display_vulnerability_match(m);
+                    println!("Summary:");
+                    println!("  Critical (9.0+): {}", critical);
+                    println!("  High (7.0-8.9):  {}", high);
+                    println!("  Medium (4.0-6.9): {}", medium);
+                    println!("  Low (0.0-3.9):   {}", low);
+
+                    // KEV summary
+                    let kev_count = matches.iter().filter(|m| m.kev_entry.is_some()).count();
+                    let ransomware_count = matches.iter().filter(|m| {
+                        m.kev_entry.as_ref()
+                            .map(|k| k.known_ransomware_campaign_use == "Known")
+                            .unwrap_or(false)
+                    }).count();
+
+                    if kev_count > 0 {
+                        println!();
+                        println!("  CISA KEV:");
+                        println!("    Known Exploited: {}", kev_count);
+                        if ransomware_count > 0 {
+                            println!("    Ransomware Associated: {}", ransomware_count);
+                        }
+                    }
+
+                    println!();
+
+                    for m in &matches {
+                        display_vulnerability_match(m);
+                    }
                 }
             }
         }
@@ -1345,6 +1964,7 @@ async fn main() -> Result<(), NvdError> {
             min_severity,
             output,
             output_file,
+            kev_file,
         } => {
             // Check for Claude API key
             let claude_api_key = std::env::var("ANTHROPIC_API_KEY").or_else(|_| std::env::var("CLAUDE_API_KEY"));
@@ -1366,6 +1986,10 @@ async fn main() -> Result<(), NvdError> {
             }
 
             println!("Database: {} CVEs (last sync: {})\n", db.cve_count, db.last_sync);
+
+            // Fetch fresh KEV catalog
+            let kev_catalog = load_kev_live(&client, kev_file.as_ref()).await;
+
             println!("Loading SBOM from: {}\n", sbom.display());
 
             let components = parse_sbom(&sbom)?;
@@ -1373,7 +1997,7 @@ async fn main() -> Result<(), NvdError> {
 
             // Scan for vulnerabilities
             println!("Scanning for vulnerabilities...");
-            let matches = scan_sbom_local(&db, &components, min_severity);
+            let matches = scan_sbom_local(&db, &components, min_severity, kev_catalog.as_ref());
 
             if matches.is_empty() {
                 println!(
@@ -1416,6 +2040,11 @@ async fn main() -> Result<(), NvdError> {
                                 "component": m.component.name,
                                 "version": m.component.version,
                                 "cvss_score": m.cve.base_score(),
+                                "in_kev": m.kev_entry.is_some(),
+                                "ransomware_use": m.kev_entry.as_ref()
+                                    .map(|k| k.known_ransomware_campaign_use.clone()),
+                                "kev_due_date": m.kev_entry.as_ref()
+                                    .map(|k| k.due_date.clone()),
                                 "description": m.cve.english_description()
                             })
                         }).collect::<Vec<_>>()
@@ -1425,7 +2054,7 @@ async fn main() -> Result<(), NvdError> {
                 "text" => {
                     // Plain text format
                     let mut text = String::new();
-                    text.push_str(&format!("VULNERABILITY ANALYSIS REPORT\n"));
+                    text.push_str("VULNERABILITY ANALYSIS REPORT\n");
                     text.push_str(&format!("SBOM: {}\n", sbom_name));
                     text.push_str(&format!("Date: {}\n", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
                     text.push_str(&format!("Vulnerabilities: {}\n", matches.len()));
@@ -1483,9 +2112,43 @@ async fn main() -> Result<(), NvdError> {
                 println!("    High (7.0-8.9):  {}", high);
                 println!("    Medium (4.0-6.9): {}", medium);
             }
+
+            // KEV catalog stats
+            println!();
+            let kev_catalog = load_kev_live(&client, None).await;
+            match kev_catalog {
+                Some(kev) if kev.kev_count > 0 => {
+                    let kev_path = KevCatalog::get_db_path()?;
+                    println!("CISA KEV Catalog Statistics");
+                    println!("═══════════════════════════════════════");
+                    println!("  Location: {:?}", kev_path);
+                    println!("  Last sync: {}", kev.last_sync);
+                    println!("  Catalog version: {}", kev.catalog_version);
+                    println!("  Date released: {}", kev.date_released);
+                    println!("  Total KEV entries: {}", kev.kev_count);
+                    println!("  Ransomware-associated: {}", kev.ransomware_count());
+                    println!("  Overdue (past due date): {}", kev.overdue_count());
+
+                    // Show overlap with CVE database
+                    if db.cve_count > 0 {
+                        let overlap = kev.vulnerabilities.keys()
+                            .filter(|cve_id| db.get(cve_id).is_some())
+                            .count();
+                        println!(
+                            "  In local CVE DB: {} of {} ({:.1}%)",
+                            overlap,
+                            kev.kev_count,
+                            (overlap as f64 / kev.kev_count as f64) * 100.0
+                        );
+                    }
+                }
+                _ => {
+                    println!("CISA KEV Catalog: Not available");
+                }
+            }
         }
 
-        Commands::Lookup { cve_id } => {
+        Commands::Lookup { cve_id, kev_file } => {
             // Validate CVE ID format to prevent injection
             let cve_pattern = Regex::new(r"^CVE-\d{4}-\d{4,}$").unwrap();
             if !cve_pattern.is_match(&cve_id) {
@@ -1493,11 +2156,19 @@ async fn main() -> Result<(), NvdError> {
                 return Ok(());
             }
 
+            // Fetch fresh KEV catalog
+            let kev_catalog = load_kev_live(&client, kev_file.as_ref()).await;
+
             // Try local DB first
             let db = CveDatabase::load()?;
             if let Some(cve) = db.get(&cve_id) {
                 println!("Found in local database:\n");
                 display_cve(cve, true);
+
+                // Show KEV status
+                if let Some(ref kev) = kev_catalog {
+                    display_kev_status(kev, &cve_id);
+                }
                 return Ok(());
             }
 
@@ -1509,6 +2180,11 @@ async fn main() -> Result<(), NvdError> {
                 println!("CVE not found: {}", cve_id);
             } else {
                 display_cve(&response.vulnerabilities[0].cve, true);
+
+                // Show KEV status
+                if let Some(ref kev) = kev_catalog {
+                    display_kev_status(kev, &cve_id);
+                }
             }
         }
 

@@ -1,6 +1,6 @@
 # NVD CVE Scanner
 
-A fast, local-first vulnerability scanner that checks your Software Bill of Materials (SBOM) against the National Vulnerability Database (NVD), with AI-powered analysis and remediation guidance.
+A vulnerability scanner that checks your Software Bill of Materials (SBOM) against the National Vulnerability Database (NVD) and CISA KEV, with AI-powered analysis and remediation guidance.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.78%2B-blue.svg)](https://www.rust-lang.org/)
@@ -11,12 +11,12 @@ I've always wanted a simple tool to review the latest CVEs against the packages 
 
 ## Features
 
-- **🚀 Fast Local Scanning** - Sync CVEs once, scan instantly without API calls
 - **📦 SBOM Support** - Parses CycloneDX and SPDX (JSON) formats
 - **🤖 AI-Powered Analysis** - Uses Claude to prioritize vulnerabilities and provide remediation guidance
 - **🎯 Smart Matching** - Matches by CPE, PURL, vendor, and product name
 - **📊 Multiple Output Formats** - Markdown, JSON, and plain text reports
 - **🔒 Low Temperature AI** - Consistent, factual analysis without speculation
+- **🛡️ CISA KEV Integration** - Automatically enriches results with the [CISA Known Exploited Vulnerabilities](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) catalog, prioritizing actively exploited CVEs above all others
 
 ## Quick Start
 
@@ -82,10 +82,11 @@ cargo run -- sync --days 30 --force
 **Options:**
 - `-d, --days <DAYS>` - Number of days to sync (default: 7, max: 120)
 - `-f, --force` - Force full re-sync, ignoring existing data
+- `--no-kev` - Skip CISA KEV catalog sync
 
 ### `scan` - Scan SBOM Against Local Database
 
-Fast local scan with no API calls required.
+Fast local scan. Automatically fetches the latest CISA KEV catalog to enrich results with known exploitation status.
 
 ```bash
 # Basic scan
@@ -93,15 +94,27 @@ cargo run -- scan --sbom ./sbom.json
 
 # Filter by minimum severity
 cargo run -- scan --sbom ./sbom.json --min-severity 7.0
+
+# Save report as markdown
+cargo run -- scan --sbom ./sbom.json -o markdown -f report.md
+
+# Save report as JSON
+cargo run -- scan --sbom ./sbom.json -o json -f report.json
+
+# Use a manually downloaded KEV catalog (for air-gapped environments)
+cargo run -- scan --sbom ./sbom.json --kev-file ./known_exploited_vulnerabilities.json
 ```
 
 **Options:**
 - `-s, --sbom <PATH>` - Path to SBOM file (required)
 - `-m, --min-severity <SCORE>` - Minimum CVSS score to report (default: 0.0)
+- `-o, --output <FORMAT>` - Output format: `text`, `json`, or `markdown` (default: text)
+- `-f, --output-file <PATH>` - Save scan results to file
+- `--kev-file <PATH>` - Path to a manually downloaded CISA KEV catalog JSON file
 
 ### `analyze` - AI-Powered Vulnerability Analysis
 
-Scans your SBOM and uses Claude to provide risk prioritization and remediation guidance.
+Scans your SBOM and uses Claude to provide risk prioritization and remediation guidance. KEV data is included in the AI prompt so Claude can factor in active exploitation status.
 
 ```bash
 # Analyze with markdown output
@@ -122,10 +135,11 @@ cargo run -- analyze --sbom ./sbom.json --output json -f report.json
 - `-m, --min-severity <SCORE>` - Minimum CVSS score to analyze (default: 7.0)
 - `-o, --output <FORMAT>` - Output format: `markdown`, `json`, or `text` (default: markdown)
 - `-f, --output-file <PATH>` - Save analysis to file
+- `--kev-file <PATH>` - Path to a manually downloaded CISA KEV catalog JSON file
 
 ### `stats` - Database Statistics
 
-View information about your local CVE database.
+View information about your local CVE and KEV databases.
 
 ```bash
 cargo run -- stats
@@ -133,11 +147,14 @@ cargo run -- stats
 
 ### `lookup` - Look Up Specific CVE
 
-Search for a CVE by ID (checks local database first, then NVD API).
+Search for a CVE by ID (checks local database first, then NVD API). Also shows CISA KEV status if the CVE is a known exploited vulnerability.
 
 ```bash
 cargo run -- lookup CVE-2024-1234
 ```
+
+**Options:**
+- `--kev-file <PATH>` - Path to a manually downloaded CISA KEV catalog JSON file
 
 ### `recent` - Fetch Recent CVEs
 
@@ -200,17 +217,33 @@ The scanner uses multiple strategies to match SBOM components to CVEs:
 
 Version ranges are respected when specified in CVE configurations.
 
+## CISA KEV Integration
+
+The scanner automatically fetches the [CISA Known Exploited Vulnerabilities (KEV)](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) catalog on every scan. Vulnerabilities confirmed by CISA to be actively exploited in the wild are:
+
+- **Sorted above all non-KEV vulnerabilities**, regardless of CVSS score (a CVSS 7.0 with active exploitation ranks above a CVSS 9.8 without)
+- **Flagged with KEV badges** showing date added, remediation due date, ransomware association, and required action
+- **Fed into AI analysis** so Claude can factor exploitation status into its prioritization
+
+Within the KEV tier, results are further sorted by:
+1. Ransomware-associated CVEs first
+2. Earliest remediation due date (most urgent)
+3. CVSS score descending
+
+The KEV catalog (~400KB) is cached locally for offline fallback. For air-gapped environments, use `--kev-file <path>` to provide a manually downloaded copy.
+
 ## AI Analysis
 
 The `analyze` command uses Claude (Sonnet) with a low temperature (0.1) for consistent, factual analysis. The AI provides:
 
 1. **Executive Summary** - Overall security posture assessment
-2. **Risk-Prioritized List** - Vulnerabilities ranked by actual risk, not just CVSS score
+2. **Risk-Prioritized List** - Vulnerabilities ranked by actual risk, considering CISA KEV status, ransomware association, CVSS score, and attack vector
 3. **Remediation Guidance** - For each CVE:
    - Immediate actions to take
    - Specific version to upgrade to
    - Workarounds if no fix is available
 4. **Summary Table** - Quick reference for action planning
+5. **CISA KEV Summary** - Overview of actively exploited vulnerabilities and compliance implications (BOD 22-01)
 
 ### Cost Estimate
 
@@ -259,11 +292,15 @@ fi
 
 ## Data Storage
 
-The CVE database is stored locally:
+The CVE database and KEV catalog are stored locally:
 
-- **macOS**: `~/Library/Application Support/com.nvd.nvd-cve-client/cve_database.json`
-- **Linux**: `~/.local/share/nvd-cve-client/cve_database.json`
-- **Windows**: `C:\Users\<User>\AppData\Roaming\nvd\nvd-cve-client\data\cve_database.json`
+- **macOS**: `~/Library/Application Support/com.nvd.nvd-cve-scanner/`
+- **Linux**: `~/.local/share/nvd-cve-scanner/`
+- **Windows**: `C:\Users\<User>\AppData\Roaming\nvd\nvd-cve-scanner\data\`
+
+Files:
+- `cve_database.json` - Synced NVD CVE data
+- `kev_catalog.json` - Cached CISA KEV catalog (auto-refreshed on each run)
 
 ## Rate Limits
 

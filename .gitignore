@@ -15,8 +15,10 @@ Cargo.lock
 .DS_Store
 Thumbs.db
 
-# Local database (can be large)
+# Local databases (can be large)
 cve_database.json
+kev_catalog.json
 
 # Generated reports (keep README)
 vulnerability-report.*
+report.md*
