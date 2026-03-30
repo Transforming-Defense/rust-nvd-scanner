@@ -22,3 +22,5 @@ kev_catalog.json
 # Generated reports (keep README)
 vulnerability-report.*
 report.md*
+sboms/*
+
