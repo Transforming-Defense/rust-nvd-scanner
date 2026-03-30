@@ -12,6 +12,7 @@ I've always wanted a simple tool to review the latest CVEs against the packages 
 ## Features
 
 - **📦 SBOM Support** - Parses CycloneDX and SPDX (JSON) formats
+- **📚 Multi-SBOM Aggregation** - Scan a single SBOM file or an entire directory and consolidate findings into one prioritized report
 - **🤖 AI-Powered Analysis** - Uses Claude or OpenAI/Codex to prioritize vulnerabilities and provide remediation guidance
 - **🎯 Smart Matching** - Matches by CPE, PURL, vendor, and product name
 - **📊 Multiple Output Formats** - Markdown, JSON, and plain text reports
@@ -59,14 +60,17 @@ AI_PROVIDER=claude
 # 1. Sync the CVE database (one-time, then periodic updates)
 cargo run -- sync --days 30
 
-# 2. Scan your SBOM
+# 2. Scan your SBOM (file or directory)
 cargo run -- scan --sbom ./your-sbom.json
 
-# 3. Get AI-powered analysis
-cargo run -- analyze --sbom ./your-sbom.json --min-severity 7.0 -f report.md
+# 3. Scan all SBOMs in a directory and consolidate report
+cargo run -- scan --sbom ./sboms --output markdown -f report.md
 
-# 4. Use OpenAI/Codex instead
-cargo run -- analyze --sbom ./your-sbom.json --ai-provider openai --ai-model gpt-5.3-codex -f report.md
+# 4. Get AI-powered consolidated prioritization
+cargo run -- analyze --sbom ./sboms --min-severity 7.0 -f report.md
+
+# 5. Use OpenAI/Codex instead
+cargo run -- analyze --sbom ./sboms --ai-provider openai --ai-model gpt-5.4 -f report.md
 ```
 
 ## Commands
@@ -99,6 +103,9 @@ Fast local scan. Automatically fetches the latest CISA KEV catalog to enrich res
 # Basic scan
 cargo run -- scan --sbom ./sbom.json
 
+# Scan all SBOM JSON files in a directory
+cargo run -- scan --sbom ./sboms
+
 # Filter by minimum severity
 cargo run -- scan --sbom ./sbom.json --min-severity 7.0
 
@@ -113,7 +120,7 @@ cargo run -- scan --sbom ./sbom.json --kev-file ./known_exploited_vulnerabilitie
 ```
 
 **Options:**
-- `-s, --sbom <PATH>` - Path to SBOM file (required)
+- `-s, --sbom <PATH>` - Path to an SBOM file, or a directory containing SBOM JSON files (required)
 - `-m, --min-severity <SCORE>` - Minimum CVSS score to report (default: 0.0)
 - `-o, --output <FORMAT>` - Output format: `text`, `json`, or `markdown` (default: text)
 - `-f, --output-file <PATH>` - Save scan results to file
@@ -126,6 +133,9 @@ Scans your SBOM and uses your selected AI provider (Claude or OpenAI/Codex) to p
 ```bash
 # Analyze with markdown output
 cargo run -- analyze --sbom ./sbom.json
+
+# Analyze all SBOM JSON files in a directory with consolidated prioritization
+cargo run -- analyze --sbom ./sboms
 
 # Analyze with OpenAI Codex model
 cargo run -- analyze --sbom ./sbom.json --ai-provider openai --ai-model gpt-5.3-codex
@@ -141,7 +151,7 @@ cargo run -- analyze --sbom ./sbom.json --output json -f report.json
 ```
 
 **Options:**
-- `-s, --sbom <PATH>` - Path to SBOM file (required)
+- `-s, --sbom <PATH>` - Path to an SBOM file, or a directory containing SBOM JSON files (required)
 - `-m, --min-severity <SCORE>` - Minimum CVSS score to analyze (default: 7.0)
 - `-o, --output <FORMAT>` - Output format: `markdown`, `json`, or `text` (default: markdown)
 - `-f, --output-file <PATH>` - Save analysis to file
@@ -250,7 +260,7 @@ The KEV catalog (~400KB) is cached locally for offline fallback. For air-gapped 
 The `analyze` command supports Claude and OpenAI/Codex. Both use the same prompt and vulnerability context so output stays consistent across providers. The AI provides:
 
 1. **Executive Summary** - Overall security posture assessment
-2. **Risk-Prioritized List** - Vulnerabilities ranked by actual risk, considering CISA KEV status, ransomware association, CVSS score, and attack vector
+2. **Risk-Prioritized List** - Vulnerabilities ranked by actual risk, considering CISA KEV status, ransomware association, CVSS score, attack vector, and source SBOM context
 3. **Remediation Guidance** - For each CVE:
    - Immediate actions to take
    - Specific version to upgrade to

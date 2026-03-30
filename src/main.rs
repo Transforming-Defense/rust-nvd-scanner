@@ -64,7 +64,7 @@ enum Commands {
 
     /// Scan an SBOM against the local CVE database (fast, no API calls)
     Scan {
-        /// Path to the SBOM file (CycloneDX or SPDX JSON format)
+        /// Path to an SBOM file, or a directory containing SBOM JSON files
         #[arg(short, long)]
         sbom: PathBuf,
 
@@ -87,7 +87,7 @@ enum Commands {
 
     /// Analyze vulnerabilities with AI for prioritization and remediation
     Analyze {
-        /// Path to the SBOM file (CycloneDX or SPDX JSON format)
+        /// Path to an SBOM file, or a directory containing SBOM JSON files
         #[arg(short, long)]
         sbom: PathBuf,
 
@@ -1170,22 +1170,22 @@ impl AiClient {
     async fn analyze_vulnerabilities(
         &self,
         matches: &[VulnerabilityMatch],
-        sbom_name: &str,
+        sbom_scope: &str,
     ) -> Result<String, NvdError> {
         match self {
-            AiClient::Claude(client) => client.analyze_vulnerabilities(matches, sbom_name).await,
-            AiClient::OpenAi(client) => client.analyze_vulnerabilities(matches, sbom_name).await,
+            AiClient::Claude(client) => client.analyze_vulnerabilities(matches, sbom_scope).await,
+            AiClient::OpenAi(client) => client.analyze_vulnerabilities(matches, sbom_scope).await,
         }
     }
 }
 
-fn build_analysis_prompt(matches: &[VulnerabilityMatch], sbom_name: &str) -> String {
+fn build_analysis_prompt(matches: &[VulnerabilityMatch], sbom_scope: &str) -> String {
     let vuln_summary = build_vulnerability_summary(matches);
     format!(
-        r#"You are a cybersecurity expert analyzing vulnerabilities found in a software bill of materials (SBOM).
+        r#"You are a cybersecurity expert analyzing vulnerabilities found across one or more software bills of materials (SBOMs).
 
 ## Context
-SBOM: {sbom_name}
+SBOM Scope: {sbom_scope}
 Total vulnerabilities found: {count}
 
 ## Vulnerability Data
@@ -1218,7 +1218,7 @@ For each vulnerability (in priority order), provide:
 - **Workaround**: If no fix is available, what compensating controls can be applied
 
 ### 4. Summary Table
-Provide a table with columns: Priority | CVE ID | Component | CVSS | KEV | Recommended Action
+Provide a table with columns: Priority | CVE ID | Component | Source SBOM(s) | CVSS | KEV | Recommended Action
 
 ### 5. CISA KEV Summary
 If any vulnerabilities are in the CISA KEV catalog, provide:
@@ -1228,7 +1228,7 @@ If any vulnerabilities are in the CISA KEV catalog, provide:
 - Compliance implications (reference BOD 22-01 if applicable)
 
 Be concise but thorough. Focus on actionable guidance."#,
-        sbom_name = sbom_name,
+        sbom_scope = sbom_scope,
         count = matches.len(),
         vuln_summary = vuln_summary
     )
@@ -1247,6 +1247,10 @@ fn build_vulnerability_summary(matches: &[VulnerabilityMatch]) -> String {
             "- **Component**: {} {}\n",
             component.name,
             component.version.as_deref().unwrap_or("(unknown version)")
+        ));
+        summary.push_str(&format!(
+            "- **Source SBOM(s)**: {}\n",
+            m.sbom_sources.join(", ")
         ));
 
         if let Some((score, severity)) = cve.highest_cvss_score() {
@@ -1366,9 +1370,9 @@ impl ClaudeClient {
     async fn analyze_vulnerabilities(
         &self,
         matches: &[VulnerabilityMatch],
-        sbom_name: &str,
+        sbom_scope: &str,
     ) -> Result<String, NvdError> {
-        let prompt = build_analysis_prompt(matches, sbom_name);
+        let prompt = build_analysis_prompt(matches, sbom_scope);
 
         let request = ClaudeRequest {
             model: self.model.clone(),
@@ -1456,9 +1460,9 @@ impl OpenAiClient {
     async fn analyze_vulnerabilities(
         &self,
         matches: &[VulnerabilityMatch],
-        sbom_name: &str,
+        sbom_scope: &str,
     ) -> Result<String, NvdError> {
-        let prompt = build_analysis_prompt(matches, sbom_name);
+        let prompt = build_analysis_prompt(matches, sbom_scope);
 
         let request = OpenAiRequest {
             model: self.model.clone(),
@@ -1647,146 +1651,93 @@ impl Cve {
 // Local SBOM Scanner
 // ============================================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
+struct SbomScanInfo {
+    name: String,
+    path: String,
+    component_count: usize,
+    vulnerability_count: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct VulnerabilityMatch {
     pub component: SbomComponent,
     pub cve: Cve,
     pub match_type: String,
     pub kev_entry: Option<KevVulnerability>,
+    pub sbom_sources: Vec<String>,
 }
 
-pub fn scan_sbom_local(
-    db: &CveDatabase,
-    components: &[SbomComponent],
-    min_severity: f64,
-    kev_catalog: Option<&KevCatalog>,
-) -> Vec<VulnerabilityMatch> {
-    let mut matches = Vec::new();
-    // Use HashSet for O(1) duplicate detection instead of O(n) linear search
-    let mut seen: HashSet<(String, String)> = HashSet::new();
+fn collect_sbom_files(sbom_input: &PathBuf) -> Result<Vec<PathBuf>, NvdError> {
+    if !sbom_input.exists() {
+        return Err(NvdError::SbomError(format!(
+            "SBOM path does not exist: {}",
+            sbom_input.display()
+        )));
+    }
 
-    println!(
-        "Scanning {} components against {} CVEs...\n",
-        components.len(),
-        db.cve_count
-    );
+    if sbom_input.is_file() {
+        return Ok(vec![sbom_input.clone()]);
+    }
 
-    // Build lookup index: product name -> CVEs
-    let mut product_index: HashMap<String, Vec<&Cve>> = HashMap::new();
-    for cve in db.iter() {
-        for (vendor, product, _, _) in cve.affected_products() {
-            product_index.entry(product.clone()).or_default().push(cve);
-            // Also index by vendor:product
-            product_index
-                .entry(format!("{}:{}", vendor, product))
-                .or_default()
-                .push(cve);
+    if !sbom_input.is_dir() {
+        return Err(NvdError::SbomError(format!(
+            "SBOM path is not a file or directory: {}",
+            sbom_input.display()
+        )));
+    }
+
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(sbom_input)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let is_json = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+
+        if is_json {
+            files.push(path);
         }
     }
 
-    for component in components {
-        let name_lower = component.name.to_lowercase();
-        let version = component.version.as_deref();
+    files.sort();
 
-        // Try exact product name match
-        if let Some(cves) = product_index.get(&name_lower) {
-            for cve in cves {
-                if let Some(score) = cve.base_score() {
-                    if score >= min_severity {
-                        if version_matches(cve, version) {
-                            let key = (cve.id.clone(), component.name.clone());
-                            if seen.insert(key) {
-                                matches.push(VulnerabilityMatch {
-                                    component: component.clone(),
-                                    cve: (*cve).clone(),
-                                    match_type: "product name".to_string(),
-                                    kev_entry: kev_catalog.and_then(|k| k.get(&cve.id).cloned()),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Try vendor:product match if we have vendor info
-        if let Some(ref vendor) = component.vendor {
-            let key = format!("{}:{}", vendor.to_lowercase(), name_lower);
-            if let Some(cves) = product_index.get(&key) {
-                for cve in cves {
-                    if let Some(score) = cve.base_score() {
-                        if score >= min_severity {
-                            if version_matches(cve, version) {
-                                let seen_key = (cve.id.clone(), component.name.clone());
-                                if seen.insert(seen_key) {
-                                    matches.push(VulnerabilityMatch {
-                                        component: component.clone(),
-                                        cve: (*cve).clone(),
-                                        match_type: "vendor:product".to_string(),
-                                        kev_entry: kev_catalog
-                                            .and_then(|k| k.get(&cve.id).cloned()),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Try purl-based matching
-        if let Some(ref purl) = component.purl {
-            if let Some((vendor, product, _)) = parse_purl(purl) {
-                let product_lower = product.to_lowercase();
-
-                if let Some(cves) = product_index.get(&product_lower) {
-                    for cve in cves {
-                        if let Some(score) = cve.base_score() {
-                            if score >= min_severity {
-                                if version_matches(cve, version) {
-                                    let seen_key = (cve.id.clone(), component.name.clone());
-                                    if seen.insert(seen_key) {
-                                        matches.push(VulnerabilityMatch {
-                                            component: component.clone(),
-                                            cve: (*cve).clone(),
-                                            match_type: "purl".to_string(),
-                                            kev_entry: kev_catalog
-                                                .and_then(|k| k.get(&cve.id).cloned()),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Also try vendor:product from purl
-                let key = format!("{}:{}", vendor.to_lowercase(), product_lower);
-                if let Some(cves) = product_index.get(&key) {
-                    for cve in cves {
-                        if let Some(score) = cve.base_score() {
-                            if score >= min_severity {
-                                if version_matches(cve, version) {
-                                    let seen_key = (cve.id.clone(), component.name.clone());
-                                    if seen.insert(seen_key) {
-                                        matches.push(VulnerabilityMatch {
-                                            component: component.clone(),
-                                            cve: (*cve).clone(),
-                                            match_type: "purl vendor:product".to_string(),
-                                            kev_entry: kev_catalog
-                                                .and_then(|k| k.get(&cve.id).cloned()),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if files.is_empty() {
+        return Err(NvdError::SbomError(format!(
+            "No SBOM JSON files found in directory: {}",
+            sbom_input.display()
+        )));
     }
 
-    // Sort by: KEV status first, then ransomware, then due date urgency, then CVSS score
+    Ok(files)
+}
+
+fn sbom_display_name(path: &PathBuf) -> String {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn build_sbom_scope_label(sbom_input: &PathBuf, scanned_sboms: &[SbomScanInfo]) -> String {
+    if scanned_sboms.len() == 1 {
+        scanned_sboms[0].name.clone()
+    } else {
+        format!(
+            "{} SBOM files from {}",
+            scanned_sboms.len(),
+            sbom_input.display()
+        )
+    }
+}
+
+fn sort_vulnerability_matches(matches: &mut [VulnerabilityMatch]) {
     matches.sort_by(|a, b| {
         let a_is_kev = a.kev_entry.is_some();
         let b_is_kev = b.kev_entry.is_some();
@@ -1839,6 +1790,225 @@ pub fn scan_sbom_local(
             .partial_cmp(&score_a)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
+}
+
+fn merge_vulnerability_matches(matches: Vec<VulnerabilityMatch>) -> Vec<VulnerabilityMatch> {
+    let mut merged: Vec<VulnerabilityMatch> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+
+    for mut m in matches {
+        let key = format!(
+            "{}|{}|{}|{}",
+            m.cve.id.to_lowercase(),
+            m.component.name.to_lowercase(),
+            m.component.version.as_deref().unwrap_or("").to_lowercase(),
+            m.component.vendor.as_deref().unwrap_or("").to_lowercase()
+        );
+
+        if let Some(existing_idx) = index.get(&key).copied() {
+            let existing = &mut merged[existing_idx];
+            for source in m.sbom_sources.drain(..) {
+                if !existing.sbom_sources.contains(&source) {
+                    existing.sbom_sources.push(source);
+                }
+            }
+            existing.sbom_sources.sort();
+        } else {
+            m.sbom_sources.sort();
+            index.insert(key, merged.len());
+            merged.push(m);
+        }
+    }
+
+    sort_vulnerability_matches(&mut merged);
+    merged
+}
+
+fn scan_sboms(
+    db: &CveDatabase,
+    sbom_input: &PathBuf,
+    min_severity: f64,
+    kev_catalog: Option<&KevCatalog>,
+) -> Result<(Vec<VulnerabilityMatch>, Vec<SbomScanInfo>, usize), NvdError> {
+    let sbom_files = collect_sbom_files(sbom_input)?;
+    let mut combined_matches = Vec::new();
+    let mut scanned_sboms = Vec::new();
+    let mut total_components = 0usize;
+
+    for sbom_path in sbom_files {
+        let sbom_name = sbom_display_name(&sbom_path);
+        println!("Loading SBOM from: {}\n", sbom_path.display());
+
+        let components = parse_sbom(&sbom_path)?;
+        println!("Found {} components in {}\n", components.len(), sbom_name);
+        total_components += components.len();
+
+        let matches = scan_sbom_local(
+            db,
+            &components,
+            min_severity,
+            kev_catalog,
+            sbom_name.as_str(),
+        );
+        println!(
+            "Matched {} vulnerabilities in {}\n",
+            matches.len(),
+            sbom_name
+        );
+
+        scanned_sboms.push(SbomScanInfo {
+            name: sbom_name,
+            path: sbom_path.display().to_string(),
+            component_count: components.len(),
+            vulnerability_count: matches.len(),
+        });
+        combined_matches.extend(matches);
+    }
+
+    Ok((
+        merge_vulnerability_matches(combined_matches),
+        scanned_sboms,
+        total_components,
+    ))
+}
+
+pub fn scan_sbom_local(
+    db: &CveDatabase,
+    components: &[SbomComponent],
+    min_severity: f64,
+    kev_catalog: Option<&KevCatalog>,
+    sbom_source: &str,
+) -> Vec<VulnerabilityMatch> {
+    let mut matches = Vec::new();
+    // Use HashSet for O(1) duplicate detection instead of O(n) linear search
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+
+    println!(
+        "Scanning {} components against {} CVEs...\n",
+        components.len(),
+        db.cve_count
+    );
+
+    // Build lookup index: product name -> CVEs
+    let mut product_index: HashMap<String, Vec<&Cve>> = HashMap::new();
+    for cve in db.iter() {
+        for (vendor, product, _, _) in cve.affected_products() {
+            product_index.entry(product.clone()).or_default().push(cve);
+            // Also index by vendor:product
+            product_index
+                .entry(format!("{}:{}", vendor, product))
+                .or_default()
+                .push(cve);
+        }
+    }
+
+    for component in components {
+        let name_lower = component.name.to_lowercase();
+        let version = component.version.as_deref();
+
+        // Try exact product name match
+        if let Some(cves) = product_index.get(&name_lower) {
+            for cve in cves {
+                if let Some(score) = cve.base_score() {
+                    if score >= min_severity {
+                        if version_matches(cve, version) {
+                            let key = (cve.id.clone(), component.name.clone());
+                            if seen.insert(key) {
+                                matches.push(VulnerabilityMatch {
+                                    component: component.clone(),
+                                    cve: (*cve).clone(),
+                                    match_type: "product name".to_string(),
+                                    kev_entry: kev_catalog.and_then(|k| k.get(&cve.id).cloned()),
+                                    sbom_sources: vec![sbom_source.to_string()],
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try vendor:product match if we have vendor info
+        if let Some(ref vendor) = component.vendor {
+            let key = format!("{}:{}", vendor.to_lowercase(), name_lower);
+            if let Some(cves) = product_index.get(&key) {
+                for cve in cves {
+                    if let Some(score) = cve.base_score() {
+                        if score >= min_severity {
+                            if version_matches(cve, version) {
+                                let seen_key = (cve.id.clone(), component.name.clone());
+                                if seen.insert(seen_key) {
+                                    matches.push(VulnerabilityMatch {
+                                        component: component.clone(),
+                                        cve: (*cve).clone(),
+                                        match_type: "vendor:product".to_string(),
+                                        kev_entry: kev_catalog
+                                            .and_then(|k| k.get(&cve.id).cloned()),
+                                        sbom_sources: vec![sbom_source.to_string()],
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Try purl-based matching
+        if let Some(ref purl) = component.purl {
+            if let Some((vendor, product, _)) = parse_purl(purl) {
+                let product_lower = product.to_lowercase();
+
+                if let Some(cves) = product_index.get(&product_lower) {
+                    for cve in cves {
+                        if let Some(score) = cve.base_score() {
+                            if score >= min_severity {
+                                if version_matches(cve, version) {
+                                    let seen_key = (cve.id.clone(), component.name.clone());
+                                    if seen.insert(seen_key) {
+                                        matches.push(VulnerabilityMatch {
+                                            component: component.clone(),
+                                            cve: (*cve).clone(),
+                                            match_type: "purl".to_string(),
+                                            kev_entry: kev_catalog
+                                                .and_then(|k| k.get(&cve.id).cloned()),
+                                            sbom_sources: vec![sbom_source.to_string()],
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Also try vendor:product from purl
+                let key = format!("{}:{}", vendor.to_lowercase(), product_lower);
+                if let Some(cves) = product_index.get(&key) {
+                    for cve in cves {
+                        if let Some(score) = cve.base_score() {
+                            if score >= min_severity {
+                                if version_matches(cve, version) {
+                                    let seen_key = (cve.id.clone(), component.name.clone());
+                                    if seen.insert(seen_key) {
+                                        matches.push(VulnerabilityMatch {
+                                            component: component.clone(),
+                                            cve: (*cve).clone(),
+                                            match_type: "purl vendor:product".to_string(),
+                                            kev_entry: kev_catalog
+                                                .and_then(|k| k.get(&cve.id).cloned()),
+                                            sbom_sources: vec![sbom_source.to_string()],
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    sort_vulnerability_matches(&mut matches);
 
     matches
 }
@@ -1925,6 +2095,7 @@ fn display_vulnerability_match(m: &VulnerabilityMatch) {
         println!("  PURL: {}", purl);
     }
     println!("  Match type: {}", m.match_type);
+    println!("  Source SBOM(s): {}", m.sbom_sources.join(", "));
 
     if let Some(ref kev) = m.kev_entry {
         println!();
@@ -1946,11 +2117,14 @@ fn display_vulnerability_match(m: &VulnerabilityMatch) {
 
 fn format_scan_output(
     matches: &[VulnerabilityMatch],
-    sbom_name: &str,
+    sbom_scope: &str,
+    scanned_sboms: &[SbomScanInfo],
     min_severity: f64,
     scan_time_ms: f64,
     format: &str,
 ) -> String {
+    let sbom_file_count = scanned_sboms.len();
+    let total_components: usize = scanned_sboms.iter().map(|s| s.component_count).sum();
     let critical = matches
         .iter()
         .filter(|m| m.cve.base_score().unwrap_or(0.0) >= 9.0)
@@ -1987,7 +2161,10 @@ fn format_scan_output(
     match format {
         "json" => {
             let json_output = serde_json::json!({
-                "sbom": sbom_name,
+                "sbom_scope": sbom_scope,
+                "sbom_file_count": sbom_file_count,
+                "total_components_scanned": total_components,
+                "scanned_sboms": scanned_sboms,
                 "scan_date": Utc::now().to_rfc3339(),
                 "scan_time_ms": scan_time_ms,
                 "total_vulnerabilities": matches.len(),
@@ -2005,6 +2182,7 @@ fn format_scan_output(
                         "cve_id": m.cve.id,
                         "component": m.component.name,
                         "version": m.component.version,
+                        "sbom_sources": m.sbom_sources,
                         "cvss_score": m.cve.base_score(),
                         "match_type": m.match_type,
                         "in_kev": m.kev_entry.is_some(),
@@ -2023,7 +2201,12 @@ fn format_scan_output(
         "markdown" => {
             let mut md = String::new();
             md.push_str("# Vulnerability Scan Report\n\n");
-            md.push_str(&format!("**SBOM**: {}\n\n", sbom_name));
+            md.push_str(&format!("**SBOM Scope**: {}\n\n", sbom_scope));
+            md.push_str(&format!("**SBOM Files Scanned**: {}\n\n", sbom_file_count));
+            md.push_str(&format!(
+                "**Total Components Scanned**: {}\n\n",
+                total_components
+            ));
             md.push_str(&format!(
                 "**Date**: {}\n\n",
                 Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
@@ -2046,6 +2229,16 @@ fn format_scan_output(
                 min_severity
             ));
 
+            md.push_str("## Scanned SBOMs\n\n");
+            md.push_str("| SBOM | Components | Vulnerabilities |\n");
+            md.push_str("|------|------------|-----------------|\n");
+            for sbom in scanned_sboms {
+                md.push_str(&format!(
+                    "| {} | {} | {} |\n",
+                    sbom.name, sbom.component_count, sbom.vulnerability_count
+                ));
+            }
+
             md.push_str("## Summary\n\n");
             md.push_str("| Severity | Count |\n|----------|-------|\n");
             md.push_str(&format!("| Critical (9.0+) | {} |\n", critical));
@@ -2064,8 +2257,8 @@ fn format_scan_output(
             }
 
             md.push_str("\n## Vulnerabilities\n\n");
-            md.push_str("| # | CVE ID | Component | CVSS | KEV | Description |\n");
-            md.push_str("|---|--------|-----------|------|-----|-------------|\n");
+            md.push_str("| # | CVE ID | Component | Source SBOM(s) | CVSS | KEV | Description |\n");
+            md.push_str("|---|--------|-----------|----------------|------|-----|-------------|\n");
             for (idx, m) in matches.iter().enumerate() {
                 let score = m
                     .cve
@@ -2084,12 +2277,14 @@ fn format_scan_output(
                     .chars()
                     .take(100)
                     .collect::<String>();
+                let sources = m.sbom_sources.join("<br>");
                 md.push_str(&format!(
-                    "| {} | {} | {} {} | {} | {} | {}... |\n",
+                    "| {} | {} | {} {} | {} | {} | {} | {}... |\n",
                     idx + 1,
                     m.cve.id,
                     m.component.name,
                     m.component.version.as_deref().unwrap_or(""),
+                    sources,
                     score,
                     kev_status,
                     desc.replace('|', "\\|")
@@ -2103,6 +2298,10 @@ fn format_scan_output(
                 for m in &kev_matches {
                     if let Some(ref kev) = m.kev_entry {
                         md.push_str(&format!("### {} - {}\n\n", m.cve.id, m.component.name));
+                        md.push_str(&format!(
+                            "- **Source SBOM(s)**: {}\n",
+                            m.sbom_sources.join(", ")
+                        ));
                         md.push_str(&format!("- **Date Added**: {}\n", kev.date_added));
                         md.push_str(&format!("- **Due Date**: {}\n", kev.due_date));
                         md.push_str(&format!(
@@ -2123,7 +2322,9 @@ fn format_scan_output(
             // Plain text format
             let mut text = String::new();
             text.push_str("VULNERABILITY SCAN REPORT\n");
-            text.push_str(&format!("SBOM: {}\n", sbom_name));
+            text.push_str(&format!("SBOM Scope: {}\n", sbom_scope));
+            text.push_str(&format!("SBOM Files Scanned: {}\n", sbom_file_count));
+            text.push_str(&format!("Total Components Scanned: {}\n", total_components));
             text.push_str(&format!(
                 "Date: {}\n",
                 Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
@@ -2145,6 +2346,14 @@ fn format_scan_output(
             text.push_str(&format!("Medium (4.0-6.9): {}\n", medium));
             text.push_str(&format!("Low (0.0-3.9):   {}\n", low));
             text.push_str(&format!("\n{}\n\n", "-".repeat(60)));
+            text.push_str("Scanned SBOMs:\n");
+            for sbom in scanned_sboms {
+                text.push_str(&format!(
+                    "  - {} | components: {} | vulnerabilities: {}\n",
+                    sbom.name, sbom.component_count, sbom.vulnerability_count
+                ));
+            }
+            text.push('\n');
 
             for (idx, m) in matches.iter().enumerate() {
                 let score = m
@@ -2161,6 +2370,10 @@ fn format_scan_output(
                     m.component.version.as_deref().unwrap_or(""),
                     score,
                     kev_tag
+                ));
+                text.push_str(&format!(
+                    "   Source SBOM(s): {}\n",
+                    m.sbom_sources.join(", ")
                 ));
                 if let Some(ref kev) = m.kev_entry {
                     text.push_str(&format!("   CISA KEV: Known Exploited Vulnerability\n"));
@@ -2293,26 +2506,23 @@ async fn main() -> Result<(), NvdError> {
             // Fetch fresh KEV catalog
             let kev_catalog = load_kev_live(&client, kev_file.as_ref()).await;
 
-            println!("Loading SBOM from: {}\n", sbom.display());
-
-            let components = parse_sbom(&sbom)?;
-            println!("Found {} components in SBOM\n", components.len());
-
             let start = std::time::Instant::now();
-            let matches = scan_sbom_local(&db, &components, min_severity, kev_catalog.as_ref());
+            let (matches, scanned_sboms, total_components) =
+                scan_sboms(&db, &sbom, min_severity, kev_catalog.as_ref())?;
             let elapsed = start.elapsed();
-
-            let sbom_name = sbom
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
-
+            let sbom_scope = build_sbom_scope_label(&sbom, &scanned_sboms);
             let scan_time_ms = elapsed.as_secs_f64() * 1000.0;
 
             // Build formatted output if writing to file or non-text format
             if output_file.is_some() || output != "text" {
-                let output_content =
-                    format_scan_output(&matches, sbom_name, min_severity, scan_time_ms, &output);
+                let output_content = format_scan_output(
+                    &matches,
+                    &sbom_scope,
+                    &scanned_sboms,
+                    min_severity,
+                    scan_time_ms,
+                    &output,
+                );
 
                 if let Some(ref file_path) = output_file {
                     std::fs::write(file_path, &output_content)?;
@@ -2326,6 +2536,9 @@ async fn main() -> Result<(), NvdError> {
                 println!("                    VULNERABILITY SCAN RESULTS                   ");
                 println!("════════════════════════════════════════════════════════════════\n");
                 println!("Scan completed in {:.2}ms\n", scan_time_ms);
+                println!("SBOM scope: {}", sbom_scope);
+                println!("SBOM files scanned: {}", scanned_sboms.len());
+                println!("Components scanned: {}\n", total_components);
 
                 if matches.is_empty() {
                     println!(
@@ -2390,6 +2603,16 @@ async fn main() -> Result<(), NvdError> {
                     }
 
                     println!();
+                    println!("Scanned SBOMs:");
+                    for sbom_info in &scanned_sboms {
+                        println!(
+                            "  - {} | components: {} | vulnerabilities: {}",
+                            sbom_info.name,
+                            sbom_info.component_count,
+                            sbom_info.vulnerability_count
+                        );
+                    }
+                    println!();
 
                     for m in &matches {
                         display_vulnerability_match(m);
@@ -2447,14 +2670,11 @@ async fn main() -> Result<(), NvdError> {
             // Fetch fresh KEV catalog
             let kev_catalog = load_kev_live(&client, kev_file.as_ref()).await;
 
-            println!("Loading SBOM from: {}\n", sbom.display());
-
-            let components = parse_sbom(&sbom)?;
-            println!("Found {} components in SBOM\n", components.len());
-
             // Scan for vulnerabilities
             println!("Scanning for vulnerabilities...");
-            let matches = scan_sbom_local(&db, &components, min_severity, kev_catalog.as_ref());
+            let (matches, scanned_sboms, total_components) =
+                scan_sboms(&db, &sbom, min_severity, kev_catalog.as_ref())?;
+            let sbom_scope = build_sbom_scope_label(&sbom, &scanned_sboms);
 
             if matches.is_empty() {
                 println!(
@@ -2469,6 +2689,11 @@ async fn main() -> Result<(), NvdError> {
                 matches.len(),
                 min_severity
             );
+            println!(
+                "Scanned {} SBOM files ({} components total)\n",
+                scanned_sboms.len(),
+                total_components
+            );
 
             println!(
                 "Analyzing vulnerabilities with {} (model: {})...\n",
@@ -2481,13 +2706,8 @@ async fn main() -> Result<(), NvdError> {
                 }
             }
 
-            let sbom_name = sbom
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown");
-
             let analysis = ai_client
-                .analyze_vulnerabilities(&matches, sbom_name)
+                .analyze_vulnerabilities(&matches, &sbom_scope)
                 .await?;
 
             // Format output based on requested format
@@ -2495,7 +2715,10 @@ async fn main() -> Result<(), NvdError> {
                 "json" => {
                     // Wrap analysis in JSON structure
                     let json_output = serde_json::json!({
-                        "sbom": sbom_name,
+                        "sbom_scope": sbom_scope,
+                        "sbom_file_count": scanned_sboms.len(),
+                        "total_components_scanned": total_components,
+                        "scanned_sboms": scanned_sboms,
                         "scan_date": Utc::now().to_rfc3339(),
                         "total_vulnerabilities": matches.len(),
                         "min_severity_filter": min_severity,
@@ -2507,6 +2730,7 @@ async fn main() -> Result<(), NvdError> {
                                 "cve_id": m.cve.id,
                                 "component": m.component.name,
                                 "version": m.component.version,
+                                "sbom_sources": m.sbom_sources,
                                 "cvss_score": m.cve.base_score(),
                                 "in_kev": m.kev_entry.is_some(),
                                 "ransomware_use": m.kev_entry.as_ref()
@@ -2523,7 +2747,9 @@ async fn main() -> Result<(), NvdError> {
                     // Plain text format
                     let mut text = String::new();
                     text.push_str("VULNERABILITY ANALYSIS REPORT\n");
-                    text.push_str(&format!("SBOM: {}\n", sbom_name));
+                    text.push_str(&format!("SBOM Scope: {}\n", sbom_scope));
+                    text.push_str(&format!("SBOM Files Scanned: {}\n", scanned_sboms.len()));
+                    text.push_str(&format!("Total Components Scanned: {}\n", total_components));
                     text.push_str(&format!(
                         "Date: {}\n",
                         Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
@@ -2531,6 +2757,15 @@ async fn main() -> Result<(), NvdError> {
                     text.push_str(&format!("Vulnerabilities: {}\n", matches.len()));
                     text.push_str(&format!("AI Provider: {}\n", ai_config.provider.as_str()));
                     text.push_str(&format!("AI Model: {}\n", ai_client.model_name()));
+                    text.push_str("\nScanned SBOMs:\n");
+                    for sbom_info in &scanned_sboms {
+                        text.push_str(&format!(
+                            "  - {} | components: {} | vulnerabilities: {}\n",
+                            sbom_info.name,
+                            sbom_info.component_count,
+                            sbom_info.vulnerability_count
+                        ));
+                    }
                     text.push_str(&format!("\n{}\n", "=".repeat(60)));
                     text.push_str(&analysis);
                     text
@@ -2539,7 +2774,15 @@ async fn main() -> Result<(), NvdError> {
                     // Markdown format (default)
                     let mut md = String::new();
                     md.push_str("# Vulnerability Analysis Report\n\n");
-                    md.push_str(&format!("**SBOM**: {}\n\n", sbom_name));
+                    md.push_str(&format!("**SBOM Scope**: {}\n\n", sbom_scope));
+                    md.push_str(&format!(
+                        "**SBOM Files Scanned**: {}\n\n",
+                        scanned_sboms.len()
+                    ));
+                    md.push_str(&format!(
+                        "**Total Components Scanned**: {}\n\n",
+                        total_components
+                    ));
                     md.push_str(&format!(
                         "**Date**: {}\n\n",
                         Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
@@ -2554,6 +2797,18 @@ async fn main() -> Result<(), NvdError> {
                         ai_config.provider.as_str()
                     ));
                     md.push_str(&format!("**AI Model**: {}\n\n", ai_client.model_name()));
+                    md.push_str("## Scanned SBOMs\n\n");
+                    md.push_str("| SBOM | Components | Vulnerabilities |\n");
+                    md.push_str("|------|------------|-----------------|\n");
+                    for sbom_info in &scanned_sboms {
+                        md.push_str(&format!(
+                            "| {} | {} | {} |\n",
+                            sbom_info.name,
+                            sbom_info.component_count,
+                            sbom_info.vulnerability_count
+                        ));
+                    }
+                    md.push_str("\n");
                     md.push_str("---\n\n");
                     md.push_str(&analysis);
                     md
