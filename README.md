@@ -12,7 +12,7 @@ I've always wanted a simple tool to review the latest CVEs against the packages 
 ## Features
 
 - **📦 SBOM Support** - Parses CycloneDX and SPDX (JSON) formats
-- **🤖 AI-Powered Analysis** - Uses Claude to prioritize vulnerabilities and provide remediation guidance
+- **🤖 AI-Powered Analysis** - Uses Claude or OpenAI/Codex to prioritize vulnerabilities and provide remediation guidance
 - **🎯 Smart Matching** - Matches by CPE, PURL, vendor, and product name
 - **📊 Multiple Output Formats** - Markdown, JSON, and plain text reports
 - **🔒 Low Temperature AI** - Consistent, factual analysis without speculation
@@ -24,7 +24,9 @@ I've always wanted a simple tool to review the latest CVEs against the packages 
 
 - Rust 1.78 or later
 - NVD API key (free) - [Request here](https://nvd.nist.gov/developers/request-an-api-key)
-- Claude API key (for AI analysis) - [Get one here](https://console.anthropic.com/)
+- AI API key (for analysis):
+  - Claude (Anthropic): [Get one here](https://console.anthropic.com/)
+  - OpenAI (Codex): [Get one here](https://platform.openai.com/)
 
 ### Installation
 
@@ -47,6 +49,8 @@ Edit `.env` with your API keys:
 ```env
 NVD_API_KEY=your-nvd-api-key-here
 ANTHROPIC_API_KEY=your-claude-api-key-here
+OPENAI_API_KEY=your-openai-api-key-here
+AI_PROVIDER=claude
 ```
 
 ### Basic Usage
@@ -60,6 +64,9 @@ cargo run -- scan --sbom ./your-sbom.json
 
 # 3. Get AI-powered analysis
 cargo run -- analyze --sbom ./your-sbom.json --min-severity 7.0 -f report.md
+
+# 4. Use OpenAI/Codex instead
+cargo run -- analyze --sbom ./your-sbom.json --ai-provider openai --ai-model gpt-5.3-codex -f report.md
 ```
 
 ## Commands
@@ -114,11 +121,14 @@ cargo run -- scan --sbom ./sbom.json --kev-file ./known_exploited_vulnerabilitie
 
 ### `analyze` - AI-Powered Vulnerability Analysis
 
-Scans your SBOM and uses Claude to provide risk prioritization and remediation guidance. KEV data is included in the AI prompt so Claude can factor in active exploitation status.
+Scans your SBOM and uses your selected AI provider (Claude or OpenAI/Codex) to provide risk prioritization and remediation guidance. KEV data is included in the AI prompt so exploitation status is factored into prioritization.
 
 ```bash
 # Analyze with markdown output
 cargo run -- analyze --sbom ./sbom.json
+
+# Analyze with OpenAI Codex model
+cargo run -- analyze --sbom ./sbom.json --ai-provider openai --ai-model gpt-5.3-codex
 
 # Focus on critical vulnerabilities
 cargo run -- analyze --sbom ./sbom.json --min-severity 9.0
@@ -136,6 +146,9 @@ cargo run -- analyze --sbom ./sbom.json --output json -f report.json
 - `-o, --output <FORMAT>` - Output format: `markdown`, `json`, or `text` (default: markdown)
 - `-f, --output-file <PATH>` - Save analysis to file
 - `--kev-file <PATH>` - Path to a manually downloaded CISA KEV catalog JSON file
+- `--ai-provider <PROVIDER>` - AI provider: `claude` or `openai` (default: `AI_PROVIDER` env var, or `claude`)
+- `--ai-model <MODEL>` - Override model name (default: `claude-sonnet-4-20250514` for Claude, `gpt-5.3-codex` for OpenAI)
+- `--reasoning-effort <EFFORT>` - OpenAI reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`
 
 ### `stats` - Database Statistics
 
@@ -223,7 +236,7 @@ The scanner automatically fetches the [CISA Known Exploited Vulnerabilities (KEV
 
 - **Sorted above all non-KEV vulnerabilities**, regardless of CVSS score (a CVSS 7.0 with active exploitation ranks above a CVSS 9.8 without)
 - **Flagged with KEV badges** showing date added, remediation due date, ransomware association, and required action
-- **Fed into AI analysis** so Claude can factor exploitation status into its prioritization
+- **Fed into AI analysis** so your configured model can factor exploitation status into its prioritization
 
 Within the KEV tier, results are further sorted by:
 1. Ransomware-associated CVEs first
@@ -234,7 +247,7 @@ The KEV catalog (~400KB) is cached locally for offline fallback. For air-gapped 
 
 ## AI Analysis
 
-The `analyze` command uses Claude (Sonnet) with a low temperature (0.1) for consistent, factual analysis. The AI provides:
+The `analyze` command supports Claude and OpenAI/Codex. Both use the same prompt and vulnerability context so output stays consistent across providers. The AI provides:
 
 1. **Executive Summary** - Overall security posture assessment
 2. **Risk-Prioritized List** - Vulnerabilities ranked by actual risk, considering CISA KEV status, ransomware association, CVSS score, and attack vector
@@ -247,12 +260,7 @@ The `analyze` command uses Claude (Sonnet) with a low temperature (0.1) for cons
 
 ### Cost Estimate
 
-Approximate Claude API costs:
-- ~100 CVEs: ~$0.15
-- ~500 CVEs: ~$0.75
-- ~1000 CVEs: ~$1.50
-
-Use `--min-severity` to reduce costs by focusing on high-priority vulnerabilities.
+Costs vary by provider and model. Use `--min-severity` to reduce cost by focusing on high-priority vulnerabilities.
 
 ## Examples
 
@@ -309,7 +317,10 @@ Files:
 - With API key: 50 requests per 30 seconds
 
 ### Claude API
-- Standard rate limits apply based on your plan
+- Standard rate limits apply based on your Anthropic plan
+
+### OpenAI API
+- Standard rate limits apply based on your OpenAI plan
 
 ## Contributing
 
@@ -330,6 +341,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [National Vulnerability Database (NVD)](https://nvd.nist.gov/) for the CVE data
 - [CISA Known Exploited Vulnerabilities Catalog (KEV)](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) for exploit data. 
 - [Anthropic](https://www.anthropic.com/) for Claude AI
+- [OpenAI](https://openai.com/) for Codex/OpenAI model support
 - The Rust community for excellent crates
 
 ## Disclaimer

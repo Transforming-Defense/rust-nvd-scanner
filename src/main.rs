@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use regex::Regex;
 use reqwest::Client;
@@ -85,7 +85,7 @@ enum Commands {
         kev_file: Option<PathBuf>,
     },
 
-    /// Analyze vulnerabilities with Claude AI for prioritization and remediation
+    /// Analyze vulnerabilities with AI for prioritization and remediation
     Analyze {
         /// Path to the SBOM file (CycloneDX or SPDX JSON format)
         #[arg(short, long)]
@@ -106,6 +106,18 @@ enum Commands {
         /// Path to a manually downloaded CISA KEV catalog JSON file
         #[arg(long)]
         kev_file: Option<PathBuf>,
+
+        /// AI provider to use for analysis
+        #[arg(long, value_enum)]
+        ai_provider: Option<AiProvider>,
+
+        /// Override the model name for the selected provider
+        #[arg(long)]
+        ai_model: Option<String>,
+
+        /// Reasoning effort (OpenAI only)
+        #[arg(long, value_enum)]
+        reasoning_effort: Option<ReasoningEffort>,
     },
 
     /// Show database statistics
@@ -131,6 +143,44 @@ enum Commands {
         #[arg(short, long, default_value = "100")]
         limit: u32,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AiProvider {
+    Claude,
+    Openai,
+}
+
+impl AiProvider {
+    fn as_str(&self) -> &'static str {
+        match self {
+            AiProvider::Claude => "claude",
+            AiProvider::Openai => "openai",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ReasoningEffort::None => "none",
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+        }
+    }
 }
 
 // ============================================================================
@@ -418,12 +468,9 @@ impl KevCatalog {
 
     /// Load KEV from a user-provided file
     pub fn load_from_file(path: &PathBuf) -> Result<Self, NvdError> {
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            NvdError::IoError(e)
-        })?;
-        let response: KevResponse = serde_json::from_str(&content).map_err(|e| {
-            NvdError::SbomError(format!("Failed to parse KEV file: {}", e))
-        })?;
+        let content = std::fs::read_to_string(path).map_err(|e| NvdError::IoError(e))?;
+        let response: KevResponse = serde_json::from_str(&content)
+            .map_err(|e| NvdError::SbomError(format!("Failed to parse KEV file: {}", e)))?;
         let mut catalog = Self::new();
         catalog.update_from_response(response);
         Ok(catalog)
@@ -661,8 +708,7 @@ static PURL_REGEX: OnceLock<Regex> = OnceLock::new();
 
 fn get_purl_regex() -> &'static Regex {
     PURL_REGEX.get_or_init(|| {
-        Regex::new(r"pkg:([^/]+)/(?:([^/]+)/)?([^@]+)(?:@(.+))?")
-            .expect("Invalid PURL regex")
+        Regex::new(r"pkg:([^/]+)/(?:([^/]+)/)?([^@]+)(?:@(.+))?").expect("Invalid PURL regex")
     })
 }
 
@@ -713,7 +759,11 @@ impl NvdClient {
     }
 
     fn rate_limit_delay(&self) -> u64 {
-        if self.api_key.is_some() { 1 } else { 6 }
+        if self.api_key.is_some() {
+            1
+        } else {
+            6
+        }
     }
 
     fn format_datetime(dt: DateTime<Utc>) -> String {
@@ -917,18 +967,14 @@ impl NvdClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            NvdError::ApiError("KEV max retries exceeded".to_string())
-        }))
+        Err(last_error
+            .unwrap_or_else(|| NvdError::ApiError("KEV max retries exceeded".to_string())))
     }
 }
 
 /// Fetch fresh KEV catalog from CISA, falling back to local cache on failure.
 /// If a kev_file path is provided, loads from that file instead.
-async fn load_kev_live(
-    client: &NvdClient,
-    kev_file: Option<&PathBuf>,
-) -> Option<KevCatalog> {
+async fn load_kev_live(client: &NvdClient, kev_file: Option<&PathBuf>) -> Option<KevCatalog> {
     // If user provided a manual KEV file, use it directly
     if let Some(path) = kev_file {
         println!("Loading KEV catalog from: {}", path.display());
@@ -970,15 +1016,14 @@ async fn load_kev_live(
                     Some(catalog)
                 }
                 _ => {
-                    eprintln!("WARNING: CISA KEV catalog unavailable (fetch failed, no local cache).");
+                    eprintln!(
+                        "WARNING: CISA KEV catalog unavailable (fetch failed, no local cache)."
+                    );
                     eprintln!("KEV enrichment will be skipped for this run.");
                     eprintln!(
                         "Tip: You can manually provide a KEV catalog file with --kev-file <path>"
                     );
-                    eprintln!(
-                        "     Download it from: {}",
-                        KEV_URL
-                    );
+                    eprintln!("     Download it from: {}", KEV_URL);
                     None
                 }
             }
@@ -987,62 +1032,157 @@ async fn load_kev_live(
 }
 
 // ============================================================================
-// Claude API Client
+// AI Analysis Clients (Claude + OpenAI/Codex)
 // ============================================================================
 
-#[derive(Debug, Serialize)]
-struct ClaudeRequest {
+const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-4-20250514";
+const DEFAULT_OPENAI_MODEL: &str = "gpt-5.3-codex";
+
+#[derive(Debug, Clone)]
+struct AnalyzeAiConfig {
+    provider: AiProvider,
     model: String,
-    max_tokens: u32,
-    temperature: f32,
-    messages: Vec<ClaudeMessage>,
+    reasoning_effort: Option<ReasoningEffort>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ClaudeMessage {
-    role: String,
-    content: String,
+fn parse_ai_provider(value: &str) -> Option<AiProvider> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "claude" | "anthropic" => Some(AiProvider::Claude),
+        "openai" | "codex" => Some(AiProvider::Openai),
+        _ => None,
+    }
 }
 
-#[derive(Debug, Deserialize)]
-struct ClaudeResponse {
-    content: Vec<ClaudeContent>,
+fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(ReasoningEffort::None),
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        "xhigh" => Some(ReasoningEffort::Xhigh),
+        _ => None,
+    }
 }
 
-#[derive(Debug, Deserialize)]
-struct ClaudeContent {
-    text: String,
+fn resolve_ai_config(
+    ai_provider: Option<AiProvider>,
+    ai_model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
+) -> Result<AnalyzeAiConfig, NvdError> {
+    let provider = if let Some(provider) = ai_provider {
+        provider
+    } else if let Ok(provider_env) = std::env::var("AI_PROVIDER") {
+        parse_ai_provider(&provider_env).ok_or_else(|| {
+            NvdError::ApiError(format!(
+                "Invalid AI_PROVIDER '{}'. Use 'claude' or 'openai'.",
+                provider_env
+            ))
+        })?
+    } else {
+        AiProvider::Claude
+    };
+
+    let model = if let Some(model) = ai_model {
+        model
+    } else {
+        match provider {
+            AiProvider::Claude => std::env::var("ANTHROPIC_MODEL")
+                .or_else(|_| std::env::var("CLAUDE_MODEL"))
+                .unwrap_or_else(|_| DEFAULT_CLAUDE_MODEL.to_string()),
+            AiProvider::Openai => {
+                std::env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string())
+            }
+        }
+    };
+
+    let resolved_reasoning = if provider == AiProvider::Openai {
+        if let Some(effort) = reasoning_effort {
+            Some(effort)
+        } else if let Ok(value) = std::env::var("OPENAI_REASONING_EFFORT") {
+            Some(parse_reasoning_effort(&value).ok_or_else(|| {
+                NvdError::ApiError(format!(
+                    "Invalid OPENAI_REASONING_EFFORT '{}'. Use one of: none, minimal, low, medium, high, xhigh.",
+                    value
+                ))
+            })?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    Ok(AnalyzeAiConfig {
+        provider,
+        model,
+        reasoning_effort: resolved_reasoning,
+    })
 }
 
-pub struct ClaudeClient {
-    client: Client,
-    api_key: String,
+fn resolve_ai_api_key(provider: AiProvider) -> Result<String, NvdError> {
+    match provider {
+        AiProvider::Claude => std::env::var("ANTHROPIC_API_KEY")
+            .or_else(|_| std::env::var("CLAUDE_API_KEY"))
+            .map_err(|_| {
+                NvdError::ApiError(
+                    "Claude API key not found. Set ANTHROPIC_API_KEY or CLAUDE_API_KEY."
+                        .to_string(),
+                )
+            }),
+        AiProvider::Openai => std::env::var("OPENAI_API_KEY").map_err(|_| {
+            NvdError::ApiError("OpenAI API key not found. Set OPENAI_API_KEY.".to_string())
+        }),
+    }
 }
 
-impl ClaudeClient {
-    pub fn new(api_key: String) -> Self {
-        // Build client with timeout for long AI responses
-        let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120)) // AI responses can take time
-            .build()
-            .expect("Failed to build HTTP client");
-
-        Self {
-            client,
+fn build_ai_client(config: &AnalyzeAiConfig, api_key: String) -> Result<AiClient, NvdError> {
+    Ok(match config.provider {
+        AiProvider::Claude => AiClient::Claude(ClaudeClient::new(api_key, config.model.clone())?),
+        AiProvider::Openai => AiClient::OpenAi(OpenAiClient::new(
             api_key,
+            config.model.clone(),
+            config.reasoning_effort,
+        )?),
+    })
+}
+
+enum AiClient {
+    Claude(ClaudeClient),
+    OpenAi(OpenAiClient),
+}
+
+impl AiClient {
+    fn provider_name(&self) -> &'static str {
+        match self {
+            AiClient::Claude(_) => "Claude",
+            AiClient::OpenAi(_) => "OpenAI/Codex",
         }
     }
 
-    pub async fn analyze_vulnerabilities(
+    fn model_name(&self) -> &str {
+        match self {
+            AiClient::Claude(client) => &client.model,
+            AiClient::OpenAi(client) => &client.model,
+        }
+    }
+
+    async fn analyze_vulnerabilities(
         &self,
         matches: &[VulnerabilityMatch],
         sbom_name: &str,
     ) -> Result<String, NvdError> {
-        // Build vulnerability summary for Claude
-        let vuln_summary = self.build_vulnerability_summary(matches);
+        match self {
+            AiClient::Claude(client) => client.analyze_vulnerabilities(matches, sbom_name).await,
+            AiClient::OpenAi(client) => client.analyze_vulnerabilities(matches, sbom_name).await,
+        }
+    }
+}
 
-        let prompt = format!(
-            r#"You are a cybersecurity expert analyzing vulnerabilities found in a software bill of materials (SBOM).
+fn build_analysis_prompt(matches: &[VulnerabilityMatch], sbom_name: &str) -> String {
+    let vuln_summary = build_vulnerability_summary(matches);
+    format!(
+        r#"You are a cybersecurity expert analyzing vulnerabilities found in a software bill of materials (SBOM).
 
 ## Context
 SBOM: {sbom_name}
@@ -1088,15 +1228,152 @@ If any vulnerabilities are in the CISA KEV catalog, provide:
 - Compliance implications (reference BOD 22-01 if applicable)
 
 Be concise but thorough. Focus on actionable guidance."#,
-            sbom_name = sbom_name,
-            count = matches.len(),
-            vuln_summary = vuln_summary
-        );
+        sbom_name = sbom_name,
+        count = matches.len(),
+        vuln_summary = vuln_summary
+    )
+}
+
+fn build_vulnerability_summary(matches: &[VulnerabilityMatch]) -> String {
+    let mut summary = String::new();
+
+    for (idx, m) in matches.iter().enumerate() {
+        let cve = &m.cve;
+        let component = &m.component;
+
+        summary.push_str(&format!("### Vulnerability {}\n", idx + 1));
+        summary.push_str(&format!("- **CVE ID**: {}\n", cve.id));
+        summary.push_str(&format!(
+            "- **Component**: {} {}\n",
+            component.name,
+            component.version.as_deref().unwrap_or("(unknown version)")
+        ));
+
+        if let Some((score, severity)) = cve.highest_cvss_score() {
+            summary.push_str(&format!("- **CVSS Score**: {:.1} ({})\n", score, severity));
+        }
+
+        let cwes = cve.cwe_ids();
+        if !cwes.is_empty() {
+            summary.push_str(&format!("- **CWE**: {}\n", cwes.join(", ")));
+        }
+
+        summary.push_str(&format!(
+            "- **Status**: {}\n",
+            cve.vuln_status.as_deref().unwrap_or("N/A")
+        ));
+
+        if let Some(desc) = cve.english_description() {
+            summary.push_str(&format!("- **Description**: {}\n", desc));
+        }
+
+        let affected = cve.affected_products();
+        if !affected.is_empty() {
+            summary.push_str("- **Affected versions**: ");
+            let version_info: Vec<String> = affected
+                .iter()
+                .take(5)
+                .map(|(v, p, ver, end)| {
+                    let mut s = format!("{}:{}", v, p);
+                    if let Some(ref version) = ver {
+                        s.push_str(&format!(" v{}", version));
+                    }
+                    if let Some(ref e) = end {
+                        s.push_str(&format!(" (up to {})", e));
+                    }
+                    s
+                })
+                .collect();
+            summary.push_str(&version_info.join(", "));
+            summary.push('\n');
+        }
+
+        if !cve.references.is_empty() {
+            summary.push_str("- **References**:\n");
+            for r in cve.references.iter().take(3) {
+                let tags = if r.tags.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", r.tags.join(", "))
+                };
+                summary.push_str(&format!("  - {}{}\n", r.url, tags));
+            }
+        }
+
+        if let Some(ref kev) = m.kev_entry {
+            summary.push_str("- **CISA KEV**: YES - Known Exploited Vulnerability\n");
+            summary.push_str(&format!("- **KEV Date Added**: {}\n", kev.date_added));
+            summary.push_str(&format!("- **KEV Due Date**: {}\n", kev.due_date));
+            summary.push_str(&format!(
+                "- **Ransomware Campaign Use**: {}\n",
+                kev.known_ransomware_campaign_use
+            ));
+            summary.push_str(&format!("- **Required Action**: {}\n", kev.required_action));
+        } else {
+            summary
+                .push_str("- **CISA KEV**: No (not in Known Exploited Vulnerabilities catalog)\n");
+        }
+
+        summary.push('\n');
+    }
+
+    summary
+}
+
+#[derive(Debug, Serialize)]
+struct ClaudeRequest {
+    model: String,
+    max_tokens: u32,
+    temperature: f32,
+    messages: Vec<ClaudeMessage>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ClaudeMessage {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeResponse {
+    content: Vec<ClaudeContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeContent {
+    text: String,
+}
+
+struct ClaudeClient {
+    client: Client,
+    api_key: String,
+    model: String,
+}
+
+impl ClaudeClient {
+    fn new(api_key: String, model: String) -> Result<Self, NvdError> {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()?;
+
+        Ok(Self {
+            client,
+            api_key,
+            model,
+        })
+    }
+
+    async fn analyze_vulnerabilities(
+        &self,
+        matches: &[VulnerabilityMatch],
+        sbom_name: &str,
+    ) -> Result<String, NvdError> {
+        let prompt = build_analysis_prompt(matches, sbom_name);
 
         let request = ClaudeRequest {
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: self.model.clone(),
             max_tokens: 8192,
-            temperature: 0.1, // Low temperature for factual, consistent analysis
+            temperature: 0.1,
             messages: vec![ClaudeMessage {
                 role: "user".to_string(),
                 content: prompt,
@@ -1130,96 +1407,147 @@ Be concise but thorough. Focus on actionable guidance."#,
             .map(|c| c.text.clone())
             .unwrap_or_else(|| "No response from Claude".to_string()))
     }
+}
 
-    fn build_vulnerability_summary(&self, matches: &[VulnerabilityMatch]) -> String {
-        let mut summary = String::new();
+#[derive(Debug, Serialize)]
+struct OpenAiRequest {
+    model: String,
+    input: Vec<OpenAiInputMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<OpenAiReasoning>,
+}
 
-        for (idx, m) in matches.iter().enumerate() {
-            let cve = &m.cve;
-            let component = &m.component;
+#[derive(Debug, Serialize)]
+struct OpenAiInputMessage {
+    role: String,
+    content: String,
+}
 
-            summary.push_str(&format!("### Vulnerability {}\n", idx + 1));
-            summary.push_str(&format!("- **CVE ID**: {}\n", cve.id));
-            summary.push_str(&format!(
-                "- **Component**: {} {}\n",
-                component.name,
-                component.version.as_deref().unwrap_or("(unknown version)")
-            ));
+#[derive(Debug, Serialize)]
+struct OpenAiReasoning {
+    effort: String,
+}
 
-            if let Some((score, severity)) = cve.highest_cvss_score() {
-                summary.push_str(&format!("- **CVSS Score**: {:.1} ({})\n", score, severity));
-            }
+struct OpenAiClient {
+    client: Client,
+    api_key: String,
+    model: String,
+    reasoning_effort: Option<ReasoningEffort>,
+}
 
-            let cwes = cve.cwe_ids();
-            if !cwes.is_empty() {
-                summary.push_str(&format!("- **CWE**: {}\n", cwes.join(", ")));
-            }
+impl OpenAiClient {
+    fn new(
+        api_key: String,
+        model: String,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> Result<Self, NvdError> {
+        let client = Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()?;
 
-            summary.push_str(&format!(
-                "- **Status**: {}\n",
-                cve.vuln_status.as_deref().unwrap_or("N/A")
-            ));
+        Ok(Self {
+            client,
+            api_key,
+            model,
+            reasoning_effort,
+        })
+    }
 
-            if let Some(desc) = cve.english_description() {
-                summary.push_str(&format!("- **Description**: {}\n", desc));
-            }
+    async fn analyze_vulnerabilities(
+        &self,
+        matches: &[VulnerabilityMatch],
+        sbom_name: &str,
+    ) -> Result<String, NvdError> {
+        let prompt = build_analysis_prompt(matches, sbom_name);
 
-            // Add affected versions info
-            let affected = cve.affected_products();
-            if !affected.is_empty() {
-                summary.push_str("- **Affected versions**: ");
-                let version_info: Vec<String> = affected
-                    .iter()
-                    .take(5)
-                    .map(|(v, p, ver, end)| {
-                        let mut s = format!("{}:{}", v, p);
-                        if let Some(ref version) = ver {
-                            s.push_str(&format!(" v{}", version));
-                        }
-                        if let Some(ref e) = end {
-                            s.push_str(&format!(" (up to {})", e));
-                        }
-                        s
-                    })
-                    .collect();
-                summary.push_str(&version_info.join(", "));
-                summary.push('\n');
-            }
+        let request = OpenAiRequest {
+            model: self.model.clone(),
+            input: vec![OpenAiInputMessage {
+                role: "user".to_string(),
+                content: prompt,
+            }],
+            reasoning: self.reasoning_effort.map(|effort| OpenAiReasoning {
+                effort: effort.as_str().to_string(),
+            }),
+        };
 
-            // Add references
-            if !cve.references.is_empty() {
-                summary.push_str("- **References**:\n");
-                for r in cve.references.iter().take(3) {
-                    let tags = if r.tags.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" [{}]", r.tags.join(", "))
-                    };
-                    summary.push_str(&format!("  - {}{}\n", r.url, tags));
-                }
-            }
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/responses")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("content-type", "application/json")
+            .json(&request)
+            .send()
+            .await?;
 
-            // Add KEV status
-            if let Some(ref kev) = m.kev_entry {
-                summary.push_str("- **CISA KEV**: YES - Known Exploited Vulnerability\n");
-                summary.push_str(&format!("- **KEV Date Added**: {}\n", kev.date_added));
-                summary.push_str(&format!("- **KEV Due Date**: {}\n", kev.due_date));
-                summary.push_str(&format!(
-                    "- **Ransomware Campaign Use**: {}\n",
-                    kev.known_ransomware_campaign_use
-                ));
-                summary.push_str(&format!("- **Required Action**: {}\n", kev.required_action));
-            } else {
-                summary.push_str(
-                    "- **CISA KEV**: No (not in Known Exploited Vulnerabilities catalog)\n",
-                );
-            }
-
-            summary.push('\n');
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(NvdError::ApiError(format!(
+                "OpenAI API error {}: {}",
+                status, body
+            )));
         }
 
-        summary
+        let openai_response: serde_json::Value = response.json().await?;
+        extract_openai_text(&openai_response).ok_or_else(|| {
+            NvdError::ApiError("No textual response returned from OpenAI".to_string())
+        })
     }
+}
+
+fn extract_openai_text(response: &serde_json::Value) -> Option<String> {
+    if let Some(text) = response.get("output_text").and_then(|v| v.as_str()) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(output_text) = response.get("output_text").and_then(|v| v.as_array()) {
+        let text = output_text
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if !text.is_empty() {
+            return Some(text);
+        }
+    }
+
+    if let Some(output_items) = response.get("output").and_then(|v| v.as_array()) {
+        let mut parts = Vec::new();
+        for item in output_items {
+            if let Some(content_items) = item.get("content").and_then(|v| v.as_array()) {
+                for content in content_items {
+                    if let Some(text) = content.get("text").and_then(|v| v.as_str()) {
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            parts.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if !parts.is_empty() {
+            return Some(parts.join("\n\n"));
+        }
+    }
+
+    if let Some(content) = response
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+    {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    None
 }
 
 // ============================================================================
@@ -1337,16 +1665,17 @@ pub fn scan_sbom_local(
     // Use HashSet for O(1) duplicate detection instead of O(n) linear search
     let mut seen: HashSet<(String, String)> = HashSet::new();
 
-    println!("Scanning {} components against {} CVEs...\n", components.len(), db.cve_count);
+    println!(
+        "Scanning {} components against {} CVEs...\n",
+        components.len(),
+        db.cve_count
+    );
 
     // Build lookup index: product name -> CVEs
     let mut product_index: HashMap<String, Vec<&Cve>> = HashMap::new();
     for cve in db.iter() {
         for (vendor, product, _, _) in cve.affected_products() {
-            product_index
-                .entry(product.clone())
-                .or_default()
-                .push(cve);
+            product_index.entry(product.clone()).or_default().push(cve);
             // Also index by vendor:product
             product_index
                 .entry(format!("{}:{}", vendor, product))
@@ -1394,7 +1723,8 @@ pub fn scan_sbom_local(
                                         component: component.clone(),
                                         cve: (*cve).clone(),
                                         match_type: "vendor:product".to_string(),
-                                        kev_entry: kev_catalog.and_then(|k| k.get(&cve.id).cloned()),
+                                        kev_entry: kev_catalog
+                                            .and_then(|k| k.get(&cve.id).cloned()),
                                     });
                                 }
                             }
@@ -1420,7 +1750,8 @@ pub fn scan_sbom_local(
                                             component: component.clone(),
                                             cve: (*cve).clone(),
                                             match_type: "purl".to_string(),
-                                            kev_entry: kev_catalog.and_then(|k| k.get(&cve.id).cloned()),
+                                            kev_entry: kev_catalog
+                                                .and_then(|k| k.get(&cve.id).cloned()),
                                         });
                                     }
                                 }
@@ -1442,7 +1773,8 @@ pub fn scan_sbom_local(
                                             component: component.clone(),
                                             cve: (*cve).clone(),
                                             match_type: "purl vendor:product".to_string(),
-                                            kev_entry: kev_catalog.and_then(|k| k.get(&cve.id).cloned()),
+                                            kev_entry: kev_catalog
+                                                .and_then(|k| k.get(&cve.id).cloned()),
                                         });
                                     }
                                 }
@@ -1468,10 +1800,14 @@ pub fn scan_sbom_local(
 
         // Within KEV tier: ransomware entries sort above non-ransomware
         if a_is_kev && b_is_kev {
-            let a_ransom = a.kev_entry.as_ref()
+            let a_ransom = a
+                .kev_entry
+                .as_ref()
                 .map(|k| k.known_ransomware_campaign_use == "Known")
                 .unwrap_or(false);
-            let b_ransom = b.kev_entry.as_ref()
+            let b_ransom = b
+                .kev_entry
+                .as_ref()
                 .map(|k| k.known_ransomware_campaign_use == "Known")
                 .unwrap_or(false);
             match (a_ransom, b_ransom) {
@@ -1481,8 +1817,16 @@ pub fn scan_sbom_local(
             }
 
             // Then by due date (earliest/most urgent first)
-            let a_due = a.kev_entry.as_ref().map(|k| k.due_date.as_str()).unwrap_or("9999-99-99");
-            let b_due = b.kev_entry.as_ref().map(|k| k.due_date.as_str()).unwrap_or("9999-99-99");
+            let a_due = a
+                .kev_entry
+                .as_ref()
+                .map(|k| k.due_date.as_str())
+                .unwrap_or("9999-99-99");
+            let b_due = b
+                .kev_entry
+                .as_ref()
+                .map(|k| k.due_date.as_str())
+                .unwrap_or("9999-99-99");
             if a_due != b_due {
                 return a_due.cmp(b_due);
             }
@@ -1491,7 +1835,9 @@ pub fn scan_sbom_local(
         // Finally, by CVSS score descending
         let score_a = a.cve.base_score().unwrap_or(0.0);
         let score_b = b.cve.base_score().unwrap_or(0.0);
-        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        score_b
+            .partial_cmp(&score_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     matches
@@ -1570,7 +1916,10 @@ fn display_vulnerability_match(m: &VulnerabilityMatch) {
     println!(
         "Component: {} {}",
         m.component.name,
-        m.component.version.as_deref().unwrap_or("(unknown version)")
+        m.component
+            .version
+            .as_deref()
+            .unwrap_or("(unknown version)")
     );
     if let Some(ref purl) = m.component.purl {
         println!("  PURL: {}", purl);
@@ -1602,22 +1951,38 @@ fn format_scan_output(
     scan_time_ms: f64,
     format: &str,
 ) -> String {
-    let critical = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) >= 9.0).count();
-    let high = matches.iter().filter(|m| {
-        let s = m.cve.base_score().unwrap_or(0.0);
-        s >= 7.0 && s < 9.0
-    }).count();
-    let medium = matches.iter().filter(|m| {
-        let s = m.cve.base_score().unwrap_or(0.0);
-        s >= 4.0 && s < 7.0
-    }).count();
-    let low = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) < 4.0).count();
+    let critical = matches
+        .iter()
+        .filter(|m| m.cve.base_score().unwrap_or(0.0) >= 9.0)
+        .count();
+    let high = matches
+        .iter()
+        .filter(|m| {
+            let s = m.cve.base_score().unwrap_or(0.0);
+            s >= 7.0 && s < 9.0
+        })
+        .count();
+    let medium = matches
+        .iter()
+        .filter(|m| {
+            let s = m.cve.base_score().unwrap_or(0.0);
+            s >= 4.0 && s < 7.0
+        })
+        .count();
+    let low = matches
+        .iter()
+        .filter(|m| m.cve.base_score().unwrap_or(0.0) < 4.0)
+        .count();
     let kev_count = matches.iter().filter(|m| m.kev_entry.is_some()).count();
-    let ransomware_count = matches.iter().filter(|m| {
-        m.kev_entry.as_ref()
-            .map(|k| k.known_ransomware_campaign_use == "Known")
-            .unwrap_or(false)
-    }).count();
+    let ransomware_count = matches
+        .iter()
+        .filter(|m| {
+            m.kev_entry
+                .as_ref()
+                .map(|k| k.known_ransomware_campaign_use == "Known")
+                .unwrap_or(false)
+        })
+        .count();
 
     match format {
         "json" => {
@@ -1659,14 +2024,27 @@ fn format_scan_output(
             let mut md = String::new();
             md.push_str("# Vulnerability Scan Report\n\n");
             md.push_str(&format!("**SBOM**: {}\n\n", sbom_name));
-            md.push_str(&format!("**Date**: {}\n\n", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+            md.push_str(&format!(
+                "**Date**: {}\n\n",
+                Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            ));
             md.push_str(&format!("**Scan Time**: {:.2}ms\n\n", scan_time_ms));
             md.push_str(&format!("**Total Vulnerabilities**: {}\n\n", matches.len()));
-            md.push_str(&format!("**CISA KEV Matches**: {} of {} in Known Exploited Vulnerabilities catalog\n\n", kev_count, matches.len()));
+            md.push_str(&format!(
+                "**CISA KEV Matches**: {} of {} in Known Exploited Vulnerabilities catalog\n\n",
+                kev_count,
+                matches.len()
+            ));
             if ransomware_count > 0 {
-                md.push_str(&format!("**Ransomware Associated**: {}\n\n", ransomware_count));
+                md.push_str(&format!(
+                    "**Ransomware Associated**: {}\n\n",
+                    ransomware_count
+                ));
             }
-            md.push_str(&format!("**Minimum Severity Filter**: {:.1}\n\n", min_severity));
+            md.push_str(&format!(
+                "**Minimum Severity Filter**: {:.1}\n\n",
+                min_severity
+            ));
 
             md.push_str("## Summary\n\n");
             md.push_str("| Severity | Count |\n|----------|-------|\n");
@@ -1674,20 +2052,34 @@ fn format_scan_output(
             md.push_str(&format!("| High (7.0-8.9) | {} |\n", high));
             md.push_str(&format!("| Medium (4.0-6.9) | {} |\n", medium));
             md.push_str(&format!("| Low (0.0-3.9) | {} |\n", low));
-            md.push_str(&format!("| **CISA KEV (Exploited)** | **{}** |\n", kev_count));
+            md.push_str(&format!(
+                "| **CISA KEV (Exploited)** | **{}** |\n",
+                kev_count
+            ));
             if ransomware_count > 0 {
-                md.push_str(&format!("| Ransomware Associated | {} |\n", ransomware_count));
+                md.push_str(&format!(
+                    "| Ransomware Associated | {} |\n",
+                    ransomware_count
+                ));
             }
 
             md.push_str("\n## Vulnerabilities\n\n");
             md.push_str("| # | CVE ID | Component | CVSS | KEV | Description |\n");
             md.push_str("|---|--------|-----------|------|-----|-------------|\n");
             for (idx, m) in matches.iter().enumerate() {
-                let score = m.cve.base_score()
+                let score = m
+                    .cve
+                    .base_score()
                     .map(|s| format!("{:.1}", s))
                     .unwrap_or_else(|| "N/A".to_string());
-                let kev_status = if m.kev_entry.is_some() { "**YES**" } else { "No" };
-                let desc = m.cve.english_description()
+                let kev_status = if m.kev_entry.is_some() {
+                    "**YES**"
+                } else {
+                    "No"
+                };
+                let desc = m
+                    .cve
+                    .english_description()
                     .unwrap_or("No description")
                     .chars()
                     .take(100)
@@ -1713,8 +2105,14 @@ fn format_scan_output(
                         md.push_str(&format!("### {} - {}\n\n", m.cve.id, m.component.name));
                         md.push_str(&format!("- **Date Added**: {}\n", kev.date_added));
                         md.push_str(&format!("- **Due Date**: {}\n", kev.due_date));
-                        md.push_str(&format!("- **Ransomware Use**: {}\n", kev.known_ransomware_campaign_use));
-                        md.push_str(&format!("- **Required Action**: {}\n\n", kev.required_action));
+                        md.push_str(&format!(
+                            "- **Ransomware Use**: {}\n",
+                            kev.known_ransomware_campaign_use
+                        ));
+                        md.push_str(&format!(
+                            "- **Required Action**: {}\n\n",
+                            kev.required_action
+                        ));
                     }
                 }
             }
@@ -1726,10 +2124,17 @@ fn format_scan_output(
             let mut text = String::new();
             text.push_str("VULNERABILITY SCAN REPORT\n");
             text.push_str(&format!("SBOM: {}\n", sbom_name));
-            text.push_str(&format!("Date: {}\n", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+            text.push_str(&format!(
+                "Date: {}\n",
+                Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+            ));
             text.push_str(&format!("Scan Time: {:.2}ms\n", scan_time_ms));
             text.push_str(&format!("Vulnerabilities: {}\n", matches.len()));
-            text.push_str(&format!("CISA KEV Matches: {} of {} in Known Exploited Vulnerabilities catalog\n", kev_count, matches.len()));
+            text.push_str(&format!(
+                "CISA KEV Matches: {} of {} in Known Exploited Vulnerabilities catalog\n",
+                kev_count,
+                matches.len()
+            ));
             if ransomware_count > 0 {
                 text.push_str(&format!("Ransomware Associated: {}\n", ransomware_count));
             }
@@ -1742,7 +2147,9 @@ fn format_scan_output(
             text.push_str(&format!("\n{}\n\n", "-".repeat(60)));
 
             for (idx, m) in matches.iter().enumerate() {
-                let score = m.cve.base_score()
+                let score = m
+                    .cve
+                    .base_score()
                     .map(|s| format!("{:.1}", s))
                     .unwrap_or_else(|| "N/A".to_string());
                 let kev_tag = if m.kev_entry.is_some() { " [KEV]" } else { "" };
@@ -1757,7 +2164,10 @@ fn format_scan_output(
                 ));
                 if let Some(ref kev) = m.kev_entry {
                     text.push_str(&format!("   CISA KEV: Known Exploited Vulnerability\n"));
-                    text.push_str(&format!("   Due Date: {} | Ransomware: {}\n", kev.due_date, kev.known_ransomware_campaign_use));
+                    text.push_str(&format!(
+                        "   Due Date: {} | Ransomware: {}\n",
+                        kev.due_date, kev.known_ransomware_campaign_use
+                    ));
                     text.push_str(&format!("   Required Action: {}\n", kev.required_action));
                 }
                 if let Some(desc) = m.cve.english_description() {
@@ -1808,7 +2218,11 @@ async fn main() -> Result<(), NvdError> {
     let client = NvdClient::new(api_key.clone());
 
     match cli.command {
-        Commands::Sync { days, force, no_kev } => {
+        Commands::Sync {
+            days,
+            force,
+            no_kev,
+        } => {
             if api_key.is_some() {
                 println!("Using NVD API key for higher rate limits\n");
             } else {
@@ -1856,7 +2270,13 @@ async fn main() -> Result<(), NvdError> {
             }
         }
 
-        Commands::Scan { sbom, min_severity, output, output_file, kev_file } => {
+        Commands::Scan {
+            sbom,
+            min_severity,
+            output,
+            output_file,
+            kev_file,
+        } => {
             let db = CveDatabase::load()?;
 
             if db.cve_count == 0 {
@@ -1865,7 +2285,10 @@ async fn main() -> Result<(), NvdError> {
                 return Ok(());
             }
 
-            println!("Database: {} CVEs (last sync: {})\n", db.cve_count, db.last_sync);
+            println!(
+                "Database: {} CVEs (last sync: {})\n",
+                db.cve_count, db.last_sync
+            );
 
             // Fetch fresh KEV catalog
             let kev_catalog = load_kev_live(&client, kev_file.as_ref()).await;
@@ -1879,7 +2302,8 @@ async fn main() -> Result<(), NvdError> {
             let matches = scan_sbom_local(&db, &components, min_severity, kev_catalog.as_ref());
             let elapsed = start.elapsed();
 
-            let sbom_name = sbom.file_name()
+            let sbom_name = sbom
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
 
@@ -1887,9 +2311,8 @@ async fn main() -> Result<(), NvdError> {
 
             // Build formatted output if writing to file or non-text format
             if output_file.is_some() || output != "text" {
-                let output_content = format_scan_output(
-                    &matches, sbom_name, min_severity, scan_time_ms, &output,
-                );
+                let output_content =
+                    format_scan_output(&matches, sbom_name, min_severity, scan_time_ms, &output);
 
                 if let Some(ref file_path) = output_file {
                     std::fs::write(file_path, &output_content)?;
@@ -1916,16 +2339,28 @@ async fn main() -> Result<(), NvdError> {
                         min_severity
                     );
 
-                    let critical = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) >= 9.0).count();
-                    let high = matches.iter().filter(|m| {
-                        let s = m.cve.base_score().unwrap_or(0.0);
-                        s >= 7.0 && s < 9.0
-                    }).count();
-                    let medium = matches.iter().filter(|m| {
-                        let s = m.cve.base_score().unwrap_or(0.0);
-                        s >= 4.0 && s < 7.0
-                    }).count();
-                    let low = matches.iter().filter(|m| m.cve.base_score().unwrap_or(0.0) < 4.0).count();
+                    let critical = matches
+                        .iter()
+                        .filter(|m| m.cve.base_score().unwrap_or(0.0) >= 9.0)
+                        .count();
+                    let high = matches
+                        .iter()
+                        .filter(|m| {
+                            let s = m.cve.base_score().unwrap_or(0.0);
+                            s >= 7.0 && s < 9.0
+                        })
+                        .count();
+                    let medium = matches
+                        .iter()
+                        .filter(|m| {
+                            let s = m.cve.base_score().unwrap_or(0.0);
+                            s >= 4.0 && s < 7.0
+                        })
+                        .count();
+                    let low = matches
+                        .iter()
+                        .filter(|m| m.cve.base_score().unwrap_or(0.0) < 4.0)
+                        .count();
 
                     println!("Summary:");
                     println!("  Critical (9.0+): {}", critical);
@@ -1935,11 +2370,15 @@ async fn main() -> Result<(), NvdError> {
 
                     // KEV summary
                     let kev_count = matches.iter().filter(|m| m.kev_entry.is_some()).count();
-                    let ransomware_count = matches.iter().filter(|m| {
-                        m.kev_entry.as_ref()
-                            .map(|k| k.known_ransomware_campaign_use == "Known")
-                            .unwrap_or(false)
-                    }).count();
+                    let ransomware_count = matches
+                        .iter()
+                        .filter(|m| {
+                            m.kev_entry
+                                .as_ref()
+                                .map(|k| k.known_ransomware_campaign_use == "Known")
+                                .unwrap_or(false)
+                        })
+                        .count();
 
                     if kev_count > 0 {
                         println!();
@@ -1965,17 +2404,32 @@ async fn main() -> Result<(), NvdError> {
             output,
             output_file,
             kev_file,
+            ai_provider,
+            ai_model,
+            reasoning_effort,
         } => {
-            // Check for Claude API key
-            let claude_api_key = std::env::var("ANTHROPIC_API_KEY").or_else(|_| std::env::var("CLAUDE_API_KEY"));
-            let claude_api_key = match claude_api_key {
-                Ok(key) => key,
-                Err(_) => {
-                    println!("Error: Claude API key not found.");
-                    println!("Set ANTHROPIC_API_KEY or CLAUDE_API_KEY in your .env file.");
+            let ai_config = match resolve_ai_config(ai_provider, ai_model, reasoning_effort) {
+                Ok(config) => config,
+                Err(e) => {
+                    println!("Error: {}", e);
                     return Ok(());
                 }
             };
+
+            if ai_config.provider == AiProvider::Claude && reasoning_effort.is_some() {
+                println!("Note: --reasoning-effort is ignored when using Claude.");
+                println!();
+            }
+
+            let ai_api_key = match resolve_ai_api_key(ai_config.provider) {
+                Ok(key) => key,
+                Err(e) => {
+                    println!("Error: {}", e);
+                    return Ok(());
+                }
+            };
+
+            let ai_client = build_ai_client(&ai_config, ai_api_key)?;
 
             let db = CveDatabase::load()?;
 
@@ -1985,7 +2439,10 @@ async fn main() -> Result<(), NvdError> {
                 return Ok(());
             }
 
-            println!("Database: {} CVEs (last sync: {})\n", db.cve_count, db.last_sync);
+            println!(
+                "Database: {} CVEs (last sync: {})\n",
+                db.cve_count, db.last_sync
+            );
 
             // Fetch fresh KEV catalog
             let kev_catalog = load_kev_live(&client, kev_file.as_ref()).await;
@@ -2013,16 +2470,25 @@ async fn main() -> Result<(), NvdError> {
                 min_severity
             );
 
-            // Analyze with Claude
-            println!("Analyzing vulnerabilities with Claude AI...\n");
-            println!("(Using low temperature for consistent, factual analysis)\n");
+            println!(
+                "Analyzing vulnerabilities with {} (model: {})...\n",
+                ai_client.provider_name(),
+                ai_client.model_name()
+            );
+            if let AiClient::OpenAi(client) = &ai_client {
+                if let Some(effort) = client.reasoning_effort {
+                    println!("OpenAI reasoning effort: {}\n", effort.as_str());
+                }
+            }
 
-            let claude_client = ClaudeClient::new(claude_api_key);
-            let sbom_name = sbom.file_name()
+            let sbom_name = sbom
+                .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("unknown");
 
-            let analysis = claude_client.analyze_vulnerabilities(&matches, sbom_name).await?;
+            let analysis = ai_client
+                .analyze_vulnerabilities(&matches, sbom_name)
+                .await?;
 
             // Format output based on requested format
             let output_content = match output.as_str() {
@@ -2033,6 +2499,8 @@ async fn main() -> Result<(), NvdError> {
                         "scan_date": Utc::now().to_rfc3339(),
                         "total_vulnerabilities": matches.len(),
                         "min_severity_filter": min_severity,
+                        "ai_provider": ai_config.provider.as_str(),
+                        "ai_model": ai_client.model_name(),
                         "analysis": analysis,
                         "vulnerabilities": matches.iter().map(|m| {
                             serde_json::json!({
@@ -2056,8 +2524,13 @@ async fn main() -> Result<(), NvdError> {
                     let mut text = String::new();
                     text.push_str("VULNERABILITY ANALYSIS REPORT\n");
                     text.push_str(&format!("SBOM: {}\n", sbom_name));
-                    text.push_str(&format!("Date: {}\n", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+                    text.push_str(&format!(
+                        "Date: {}\n",
+                        Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+                    ));
                     text.push_str(&format!("Vulnerabilities: {}\n", matches.len()));
+                    text.push_str(&format!("AI Provider: {}\n", ai_config.provider.as_str()));
+                    text.push_str(&format!("AI Model: {}\n", ai_client.model_name()));
                     text.push_str(&format!("\n{}\n", "=".repeat(60)));
                     text.push_str(&analysis);
                     text
@@ -2067,9 +2540,20 @@ async fn main() -> Result<(), NvdError> {
                     let mut md = String::new();
                     md.push_str("# Vulnerability Analysis Report\n\n");
                     md.push_str(&format!("**SBOM**: {}\n\n", sbom_name));
-                    md.push_str(&format!("**Date**: {}\n\n", Utc::now().format("%Y-%m-%d %H:%M:%S UTC")));
+                    md.push_str(&format!(
+                        "**Date**: {}\n\n",
+                        Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+                    ));
                     md.push_str(&format!("**Total Vulnerabilities**: {}\n\n", matches.len()));
-                    md.push_str(&format!("**Minimum Severity Filter**: {:.1}\n\n", min_severity));
+                    md.push_str(&format!(
+                        "**Minimum Severity Filter**: {:.1}\n\n",
+                        min_severity
+                    ));
+                    md.push_str(&format!(
+                        "**AI Provider**: {}\n\n",
+                        ai_config.provider.as_str()
+                    ));
+                    md.push_str(&format!("**AI Model**: {}\n\n", ai_client.model_name()));
                     md.push_str("---\n\n");
                     md.push_str(&analysis);
                     md
@@ -2097,15 +2581,24 @@ async fn main() -> Result<(), NvdError> {
             println!("  Total CVEs: {}", db.cve_count);
 
             if db.cve_count > 0 {
-                let critical = db.iter().filter(|c| c.base_score().unwrap_or(0.0) >= 9.0).count();
-                let high = db.iter().filter(|c| {
-                    let s = c.base_score().unwrap_or(0.0);
-                    s >= 7.0 && s < 9.0
-                }).count();
-                let medium = db.iter().filter(|c| {
-                    let s = c.base_score().unwrap_or(0.0);
-                    s >= 4.0 && s < 7.0
-                }).count();
+                let critical = db
+                    .iter()
+                    .filter(|c| c.base_score().unwrap_or(0.0) >= 9.0)
+                    .count();
+                let high = db
+                    .iter()
+                    .filter(|c| {
+                        let s = c.base_score().unwrap_or(0.0);
+                        s >= 7.0 && s < 9.0
+                    })
+                    .count();
+                let medium = db
+                    .iter()
+                    .filter(|c| {
+                        let s = c.base_score().unwrap_or(0.0);
+                        s >= 4.0 && s < 7.0
+                    })
+                    .count();
 
                 println!("\n  By Severity:");
                 println!("    Critical (9.0+): {}", critical);
@@ -2131,7 +2624,9 @@ async fn main() -> Result<(), NvdError> {
 
                     // Show overlap with CVE database
                     if db.cve_count > 0 {
-                        let overlap = kev.vulnerabilities.keys()
+                        let overlap = kev
+                            .vulnerabilities
+                            .keys()
                             .filter(|cve_id| db.get(cve_id).is_some())
                             .count();
                         println!(
@@ -2207,7 +2702,10 @@ async fn main() -> Result<(), NvdError> {
                 .get_cves_by_pub_date(start_date, end_date, 0, Some(limit))
                 .await?;
 
-            println!("Total CVEs in last {} days: {}\n", days, response.total_results);
+            println!(
+                "Total CVEs in last {} days: {}\n",
+                days, response.total_results
+            );
 
             for vuln in &response.vulnerabilities {
                 display_cve(&vuln.cve, false);
