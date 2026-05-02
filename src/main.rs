@@ -482,6 +482,41 @@ impl KevCatalog {
 // ============================================================================
 
 const MAX_DB_SIZE_BYTES: u64 = 500 * 1024 * 1024; // 500MB limit
+const DB_MAX_SIZE_ENV: &str = "RUST_NVD_SCANNER_DB_MAX_SIZE_BYTES";
+
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn recommended_db_override_bytes(actual_size: u64) -> u64 {
+    let five_percent_headroom = actual_size / 20;
+    let min_headroom = 1_048_576_u64; // 1 MiB
+    let headroom = five_percent_headroom.max(min_headroom);
+    actual_size.saturating_add(headroom)
+}
+
+fn effective_max_db_size_bytes() -> Result<u64, NvdError> {
+    let Some(raw) = std::env::var(DB_MAX_SIZE_ENV).ok() else {
+        return Ok(MAX_DB_SIZE_BYTES);
+    };
+
+    let trimmed = raw.trim();
+    let parsed = trimmed.parse::<u64>().map_err(|_| {
+        NvdError::DbError(format!(
+            "Invalid {} value '{}'. Expected a positive integer number of bytes.",
+            DB_MAX_SIZE_ENV, trimmed
+        ))
+    })?;
+
+    if parsed == 0 {
+        return Err(NvdError::DbError(format!(
+            "{} must be greater than 0 bytes.",
+            DB_MAX_SIZE_ENV
+        )));
+    }
+
+    Ok(parsed)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CveDatabase {
@@ -517,10 +552,19 @@ impl CveDatabase {
         if path.exists() {
             // Check file size before loading
             let metadata = std::fs::metadata(&path)?;
-            if metadata.len() > MAX_DB_SIZE_BYTES {
+            let effective_cap = effective_max_db_size_bytes()?;
+            if metadata.len() > effective_cap {
+                let actual_size = metadata.len();
+                let recommended_override = recommended_db_override_bytes(actual_size);
                 return Err(NvdError::DbError(format!(
-                    "Database file too large ({} bytes). Consider running sync with fewer days.",
-                    metadata.len()
+                    "Database file too large: {} bytes ({:.2} MB) exceeds limit {} bytes ({:.2} MB). \
+To proceed, set:\n  export {}={}\nThen rerun your command.",
+                    actual_size,
+                    bytes_to_mb(actual_size),
+                    effective_cap,
+                    bytes_to_mb(effective_cap),
+                    DB_MAX_SIZE_ENV,
+                    recommended_override
                 )));
             }
 
@@ -2969,4 +3013,127 @@ async fn main() -> Result<(), NvdError> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod db_size_limit_tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    #[test]
+    fn effective_db_size_uses_default_when_env_unset() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("env test lock should not be poisoned");
+        let _guard = EnvGuard::set(DB_MAX_SIZE_ENV, None);
+        assert_eq!(
+            effective_max_db_size_bytes().unwrap_or_default(),
+            MAX_DB_SIZE_BYTES
+        );
+    }
+
+    #[test]
+    fn effective_db_size_uses_valid_env_override() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("env test lock should not be poisoned");
+        let _guard = EnvGuard::set(DB_MAX_SIZE_ENV, Some("900000000"));
+        assert_eq!(
+            effective_max_db_size_bytes().unwrap_or_default(),
+            900_000_000
+        );
+    }
+
+    #[test]
+    fn effective_db_size_rejects_invalid_env_override() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("env test lock should not be poisoned");
+        let _guard = EnvGuard::set(DB_MAX_SIZE_ENV, Some("not-a-number"));
+        let err = effective_max_db_size_bytes().expect_err("invalid env should error");
+        assert!(matches!(err, NvdError::DbError(_)));
+        assert!(
+            err.to_string().contains(DB_MAX_SIZE_ENV),
+            "error should mention env var"
+        );
+    }
+
+    #[test]
+    fn effective_db_size_rejects_zero_env_override() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("env test lock should not be poisoned");
+        let _guard = EnvGuard::set(DB_MAX_SIZE_ENV, Some("0"));
+        let err = effective_max_db_size_bytes().expect_err("zero env should error");
+        assert!(matches!(err, NvdError::DbError(_)));
+    }
+
+    #[test]
+    fn recommended_override_uses_five_percent_headroom_when_larger_than_one_mib() {
+        let base = 2_000_000_000_u64;
+        let expected = base + (base / 20);
+        assert_eq!(recommended_db_override_bytes(base), expected);
+    }
+
+    #[test]
+    fn recommended_override_uses_minimum_one_mib_headroom_for_small_values() {
+        let base = 10_000_u64;
+        assert_eq!(recommended_db_override_bytes(base), base + 1_048_576);
+    }
+
+    #[test]
+    fn recommended_override_saturates_on_very_large_values() {
+        assert_eq!(recommended_db_override_bytes(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn oversized_db_error_message_includes_exact_override_command() {
+        let actual_size = 777_303_001_u64;
+        let effective_cap = 524_288_000_u64;
+        let recommended_override = recommended_db_override_bytes(actual_size);
+        let message = format!(
+            "Database file too large: {} bytes ({:.2} MB) exceeds limit {} bytes ({:.2} MB). \
+To proceed, set:\n  export {}={}\nThen rerun your command.",
+            actual_size,
+            bytes_to_mb(actual_size),
+            effective_cap,
+            bytes_to_mb(effective_cap),
+            DB_MAX_SIZE_ENV,
+            recommended_override
+        );
+
+        assert!(message.contains("Database file too large: 777303001 bytes"));
+        assert!(message.contains("export RUST_NVD_SCANNER_DB_MAX_SIZE_BYTES="));
+        assert!(message.contains(&recommended_override.to_string()));
+    }
 }

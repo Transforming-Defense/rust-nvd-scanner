@@ -5,9 +5,6 @@ A vulnerability scanner that checks your Software Bill of Materials (SBOM) again
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.78%2B-blue.svg)](https://www.rust-lang.org/)
 
-## Why did I do this?
-
-I've always wanted a simple tool to review the latest CVEs against the packages and libraries throughout my system inventory.  Since I have some holiday downtime, I felt this was a good time to kick it off.  I'm also using it as an opportunity to improve my rust skills as it's a new language for me.  Before you ask, of course I used AI I'd be a fool not to.  AI is a great learning tool. Especially when you build piece by piece like you do when you're coding from scratch, then run through and look for areas for improvement.  Please keep in mind this is a work in progress on my learning journey and also feel free to provide any advice that will make the code, and me, better!  
 
 ## Features
 
@@ -94,6 +91,14 @@ cargo run -- sync --days 30 --force
 - `-d, --days <DAYS>` - Number of days to sync (default: 7, max: 120)
 - `-f, --force` - Force full re-sync, ignoring existing data
 - `--no-kev` - Skip CISA KEV catalog sync
+
+If you see an oversized local DB error, the scanner now prints an exact override command such as:
+
+```bash
+export RUST_NVD_SCANNER_DB_MAX_SIZE_BYTES=<recommended-by-error>
+```
+
+Then rerun your command. This keeps the default 500MB safety guard in place unless you opt in.
 
 ### `scan` - Scan SBOM Against Local Database
 
