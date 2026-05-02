@@ -3018,6 +3018,12 @@ async fn main() -> Result<(), NvdError> {
 #[cfg(test)]
 mod db_size_limit_tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     struct EnvGuard {
         key: &'static str,
@@ -3046,6 +3052,9 @@ mod db_size_limit_tests {
 
     #[test]
     fn effective_db_size_uses_default_when_env_unset() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("env test lock should not be poisoned");
         let _guard = EnvGuard::set(DB_MAX_SIZE_ENV, None);
         assert_eq!(
             effective_max_db_size_bytes().unwrap_or_default(),
@@ -3055,6 +3064,9 @@ mod db_size_limit_tests {
 
     #[test]
     fn effective_db_size_uses_valid_env_override() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("env test lock should not be poisoned");
         let _guard = EnvGuard::set(DB_MAX_SIZE_ENV, Some("900000000"));
         assert_eq!(
             effective_max_db_size_bytes().unwrap_or_default(),
@@ -3064,6 +3076,9 @@ mod db_size_limit_tests {
 
     #[test]
     fn effective_db_size_rejects_invalid_env_override() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("env test lock should not be poisoned");
         let _guard = EnvGuard::set(DB_MAX_SIZE_ENV, Some("not-a-number"));
         let err = effective_max_db_size_bytes().expect_err("invalid env should error");
         assert!(matches!(err, NvdError::DbError(_)));
@@ -3075,6 +3090,9 @@ mod db_size_limit_tests {
 
     #[test]
     fn effective_db_size_rejects_zero_env_override() {
+        let _lock = env_test_lock()
+            .lock()
+            .expect("env test lock should not be poisoned");
         let _guard = EnvGuard::set(DB_MAX_SIZE_ENV, Some("0"));
         let err = effective_max_db_size_bytes().expect_err("zero env should error");
         assert!(matches!(err, NvdError::DbError(_)));
